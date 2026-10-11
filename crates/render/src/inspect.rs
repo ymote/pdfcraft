@@ -4,7 +4,7 @@
 //! lopdf (bootstrap, replaced by `pdfcraft-model` in M2). Inspection is *tolerant*: when lopdf
 //! cannot load a file that hayro can render, panels are simply empty and `warnings` says why.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -26,6 +26,19 @@ const MAX_LAYER_STATE: usize = 1024;
 
 /// At most this many layers are read from all of `/RBGroups` together.
 const MAX_LAYER_GROUP_ENTRIES: usize = 4096;
+
+// Page labels (`/PageLabels`): every size they depend on comes from the file, so each is
+// bounded. The limits are storytold/pdfcraft#480's.
+
+/// A label, prefix included, of at most this many UTF-8 bytes; a longer one isn't made, and its
+/// page keeps its physical number. A hostile `/St` asked for a label of 3.5 × 10^17 letters.
+const MAX_LABEL_BYTES: usize = 1024;
+/// A raw `/P` is checked before it is decoded: room for a whole UTF-16BE label.
+const MAX_PREFIX_BYTES: usize = 2 * MAX_LABEL_BYTES + 2;
+/// All of a document's labels together, and all its decoded prefixes together.
+const MAX_LABEL_TOTAL_BYTES: usize = 4 << 20;
+/// Number-tree entries (nodes, kids and ranges) read from `/PageLabels` in all.
+const MAX_LABEL_TREE_WORK: usize = 200_000;
 
 fn load_options(password: Option<&str>) -> LoadOptions {
     LoadOptions { password: password.map(str::to_owned), max_decompressed_size: Some(LOAD_STREAM_LIMIT), ..LoadOptions::default() }
@@ -376,7 +389,10 @@ impl<'a> Inspector<'a> {
             .and_then(|m| m.get(b"Marked").ok())
             .and_then(|o| o.as_bool().ok())
             .unwrap_or(false);
-        self.page_labels(catalog, &mut info.pages);
+        match self.page_labels(catalog, &mut info.pages) {
+            Ok(notes) => info.warnings.extend(notes.into_iter().map(|note| format!("Page labels: {note}."))),
+            Err(reason) => info.warnings.push(format!("Page labels were skipped: {reason}; using physical page numbers.")),
+        }
         if let Some(first) = catalog.get(b"Outlines").ok().and_then(|o| self.dict(o)).and_then(|d| d.get(b"First").ok()) {
             let mut seen = HashSet::new();
             info.outline = self.outline_siblings(first, &mut seen, 0);
@@ -552,45 +568,113 @@ impl<'a> Inspector<'a> {
 
     // ── page labels (ISO 32000-2 §12.4.2) ───────────────────────────────────────────────────
 
-    fn page_labels(&self, catalog: &Dictionary, pages: &mut [PageInfo]) {
-        let Some(tree) = catalog.get(b"PageLabels").ok().and_then(|o| self.dict(o)) else { return };
+    /// Apply `/PageLabels` to `pages`, within the limits above: the number tree is read once per
+    /// node and at most [`MAX_LABEL_TREE_WORK`] entries in all; a range's prefix is checked
+    /// before it is decoded, and decoded once; a label over [`MAX_LABEL_BYTES`] isn't made (its
+    /// page keeps its physical number), and labels over [`MAX_LABEL_TOTAL_BYTES`] in all are not
+    /// applied at all. `Err`: no label is applied, and why. `Ok`: what was left out.
+    fn page_labels(&self, catalog: &Dictionary, pages: &mut [PageInfo]) -> Result<Vec<String>, &'static str> {
+        let mut notes = Vec::new();
+        let Some(tree) = catalog.get(b"PageLabels").ok().and_then(|o| self.dict(o)) else { return Ok(notes) };
         let mut ranges: BTreeMap<usize, &Dictionary> = BTreeMap::new();
         let mut stack = vec![(tree, 0u32)];
+        let mut seen = HashSet::new();
+        let mut work = 0usize;
         while let Some((node, depth)) = stack.pop() {
-            if let Ok(Object::Array(nums)) = node.get(b"Nums").map(|o| self.resolve(o)) {
-                for pair in nums.chunks(2) {
-                    if let [k, v] = pair
-                        && let (Ok(start), Some(d)) = (self.resolve(k).as_i64(), self.dict(v))
-                        && start >= 0
-                    {
-                        ranges.insert(start as usize, d);
-                    }
+            // A node named twice, or a cycle, is read once.
+            if !seen.insert(node as *const Dictionary) {
+                continue;
+            }
+            let nums = match node.get(b"Nums").map(|o| self.resolve(o)) {
+                Ok(Object::Array(nums)) => nums.as_slice(),
+                _ => &[],
+            };
+            let kids = match node.get(b"Kids").map(|o| self.resolve(o)) {
+                Ok(Object::Array(kids)) if depth < 32 => kids.as_slice(),
+                _ => &[],
+            };
+            work = work.saturating_add(1).saturating_add(nums.len().div_ceil(2)).saturating_add(kids.len());
+            if work > MAX_LABEL_TREE_WORK {
+                return Err("the number tree is too large");
+            }
+            for pair in nums.chunks(2) {
+                if let [k, v] = pair
+                    && let (Ok(start), Some(d)) = (self.resolve(k).as_i64(), self.dict(v))
+                    && let Ok(start) = usize::try_from(start)
+                {
+                    ranges.insert(start, d);
                 }
             }
-            if depth < 32
-                && let Ok(Object::Array(kids)) = node.get(b"Kids").map(|o| self.resolve(o))
-            {
-                stack.extend(kids.iter().filter_map(|k| self.dict(k)).map(|d| (d, depth + 1)));
-            }
+            stack.extend(kids.iter().filter_map(|k| self.dict(k)).map(|d| (d, depth + 1)));
         }
-        for (i, page) in pages.iter_mut().enumerate() {
-            let Some((&start, d)) = ranges.range(..=i).next_back() else { continue };
-            let first = d.get(b"St").ok().and_then(|o| o.as_i64().ok()).unwrap_or(1).max(1) as usize;
-            let n = first + (i - start);
-            let prefix = self.text(d, b"P").unwrap_or_default();
-            let number = match self.name(d, b"S").as_deref() {
-                Some("D") => n.to_string(),
-                Some("R") => roman(n).to_uppercase(),
-                Some("r") => roman(n),
-                Some("A") => alpha(n).to_uppercase(),
-                Some("a") => alpha(n),
-                _ => String::new(),
+        // Each range that starts on a page, once: (first number, prefix, style). A prefix too long
+        // to show is `None`, and so are the labels of its range.
+        let mut specs = BTreeMap::new();
+        let mut prefixes = 0usize;
+        for (&start, d) in ranges.range(..pages.len()) {
+            let raw = match d.get(b"P").map(|o| self.resolve(o)) {
+                Ok(Object::String(raw, _) | Object::Name(raw)) => raw.len(),
+                _ => 0,
             };
-            page.label = format!("{prefix}{number}");
-            if page.label.is_empty() {
-                page.label = (i + 1).to_string();
+            let prefix = (raw <= MAX_PREFIX_BYTES).then(|| self.text(d, b"P").unwrap_or_default()).filter(|p| p.len() <= MAX_LABEL_BYTES);
+            prefixes = prefixes.saturating_add(prefix.as_ref().map_or(0, String::len));
+            if prefixes > MAX_LABEL_TOTAL_BYTES {
+                return Err("the label prefixes take more than 4 MiB in all");
+            }
+            let first = d.get(b"St").ok().and_then(|o| self.resolve(o).as_i64().ok()).unwrap_or(1).max(1).unsigned_abs();
+            specs.insert(start, (first, prefix, self.name(d, b"S")));
+        }
+        let mut labels = Vec::new();
+        let mut total = 0usize;
+        let mut too_long = BTreeSet::new();
+        for i in 0..pages.len() {
+            let Some((&start, (first, prefix, style))) = specs.range(..=i).next_back() else { continue };
+            let label = prefix.as_ref().and_then(|prefix| {
+                let left = MAX_LABEL_BYTES.saturating_sub(prefix.len());
+                // The page's number, checked: `/St` can be anything up to i64::MAX.
+                let n = || u64::try_from(i - start).ok().and_then(|offset| first.checked_add(offset));
+                let number = match style.as_deref() {
+                    Some("D") => n().map(|n| n.to_string()).filter(|s| s.len() <= left),
+                    Some("R") => n().and_then(|n| roman(n, left)).map(|s| s.to_ascii_uppercase()),
+                    Some("r") => n().and_then(|n| roman(n, left)),
+                    Some("A") => n().and_then(|n| alpha(n, left)).map(|s| s.to_ascii_uppercase()),
+                    Some("a") => n().and_then(|n| alpha(n, left)),
+                    _ => Some(String::new()),
+                }?;
+                Some(format!("{prefix}{number}"))
+            });
+            let Some(label) = label else {
+                too_long.insert(start);
+                continue;
+            };
+            // An empty label (no prefix, no style) keeps the physical number.
+            if label.is_empty() {
+                continue;
+            }
+            total = total.saturating_add(label.len());
+            if total > MAX_LABEL_TOTAL_BYTES {
+                return Err("the labels take more than 4 MiB in all");
+            }
+            labels.push((i, label));
+        }
+        if let Some(&first) = too_long.first() {
+            let others = match too_long.len().saturating_sub(1) {
+                0 => String::new(),
+                1 => " and 1 other range".into(),
+                n => format!(" and {n} other ranges"),
+            };
+            notes.push(format!(
+                "the labels from page {}{others} are longer than {MAX_LABEL_BYTES} bytes, so those pages show their physical numbers",
+                first.saturating_add(1)
+            ));
+        }
+        // Applied only once all of them are known to fit: never a half-labelled document.
+        for (i, label) in labels {
+            if let Some(page) = pages.get_mut(i) {
+                page.label = label;
             }
         }
+        Ok(notes)
     }
 
     // ── annotations ─────────────────────────────────────────────────────────────────────────
@@ -923,8 +1007,11 @@ fn rect4(o: &Object) -> [f32; 4] {
     }
 }
 
-fn roman(mut n: usize) -> String {
-    const T: [(usize, &str); 13] = [
+/// Lowercase Roman numerals for `n`, or `None` if they take more than `max_bytes` (at most
+/// [`MAX_LABEL_BYTES`]). Each length is checked before anything is repeated: `n` comes from the
+/// file, and its thousands alone can be quadrillions of `m`s.
+fn roman(mut n: u64, max_bytes: usize) -> Option<String> {
+    const T: [(u64, &str); 13] = [
         (1000, "m"),
         (900, "cm"),
         (500, "d"),
@@ -939,21 +1026,31 @@ fn roman(mut n: usize) -> String {
         (4, "iv"),
         (1, "i"),
     ];
+    let max_bytes = max_bytes.min(MAX_LABEL_BYTES);
     let mut s = String::new();
     for (v, r) in T {
-        while n >= v {
-            s.push_str(r);
-            n -= v;
+        let count = usize::try_from(n / v).ok()?;
+        if count.checked_mul(r.len())? > max_bytes.saturating_sub(s.len()) {
+            return None;
         }
+        s.push_str(&r.repeat(count));
+        n %= v;
     }
-    s
+    Some(s)
 }
 
-/// a..z, aa..zz, aaa.. (ISO 32000-2: "a to z for the first 26 pages, aa to zz for the next 26").
-fn alpha(n: usize) -> String {
+/// a..z, aa..zz, aaa.. (ISO 32000-2: "a to z for the first 26 pages, aa to zz for the next 26"),
+/// or `None` if that takes more than `max_bytes` (at most [`MAX_LABEL_BYTES`]), checked before
+/// the letter is repeated.
+fn alpha(n: u64, max_bytes: usize) -> Option<String> {
     let n = n.max(1) - 1;
-    let letter = (b'a' + (n % 26) as u8) as char;
-    std::iter::repeat_n(letter, n / 26 + 1).collect()
+    let count = usize::try_from(n / 26 + 1).ok()?;
+    if count > max_bytes.min(MAX_LABEL_BYTES) {
+        return None;
+    }
+    // n % 26 < 26: a lowercase ASCII letter.
+    let letter = char::from(b'a' + (n % 26) as u8);
+    Some(std::iter::repeat_n(letter, count).collect())
 }
 
 /// `D:20260930104512-04'00'` → `2026-09-30 10:45`.
@@ -1034,11 +1131,136 @@ mod tests {
 
     #[test]
     fn roman_and_alpha_labels() {
-        assert_eq!(roman(4), "iv");
-        assert_eq!(roman(1994), "mcmxciv");
-        assert_eq!(alpha(1), "a");
-        assert_eq!(alpha(27), "aa");
-        assert_eq!(alpha(53), "aaa");
+        assert_eq!(roman(4, MAX_LABEL_BYTES).as_deref(), Some("iv"));
+        assert_eq!(roman(1994, MAX_LABEL_BYTES).as_deref(), Some("mcmxciv"));
+        assert_eq!(alpha(1, MAX_LABEL_BYTES).as_deref(), Some("a"));
+        assert_eq!(alpha(27, MAX_LABEL_BYTES).as_deref(), Some("aa"));
+        assert_eq!(alpha(53, MAX_LABEL_BYTES).as_deref(), Some("aaa"));
+        // Each length is checked against the byte budget before anything is repeated.
+        assert_eq!(roman(1_024_000, MAX_LABEL_BYTES).map(|s| s.len()), Some(MAX_LABEL_BYTES));
+        assert_eq!(roman(1_024_001, MAX_LABEL_BYTES), None);
+        assert_eq!(alpha(26 * 1024, MAX_LABEL_BYTES).map(|s| s.len()), Some(MAX_LABEL_BYTES));
+        assert_eq!(alpha(26 * 1024 + 1, MAX_LABEL_BYTES), None);
+        assert_eq!(roman(4, 2).as_deref(), Some("iv"));
+        assert_eq!(roman(4, 1), None);
+        for max in [0, MAX_LABEL_BYTES, usize::MAX] {
+            assert_eq!(roman(u64::MAX, max), None);
+            assert_eq!(alpha(u64::MAX, max), None);
+        }
+    }
+
+    /// A PDF of `pages` blank pages whose catalog's `/PageLabels` is `labels`, with `extra`
+    /// objects, numbered from 10, for the label tree to refer to.
+    fn with_labels(pages: usize, labels: &str, extra: &[&str]) -> Vec<u8> {
+        let kids: Vec<String> = (0..pages).map(|i| format!("{} 0 R", 100 + i)).collect();
+        let mut pdf = format!(
+            "%PDF-1.7\n1 0 obj << /Type /Catalog /Pages 2 0 R /PageLabels {labels} >> endobj\n2 0 obj << /Type /Pages /Kids [{}] /Count {pages} >> endobj\n",
+            kids.join(" ")
+        );
+        for (i, body) in extra.iter().enumerate() {
+            pdf.push_str(&format!("{} 0 obj {body} endobj\n", 10 + i));
+        }
+        for i in 0..pages {
+            pdf.push_str(&format!("{} 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >> endobj\n", 100 + i));
+        }
+        pdf.push_str("trailer << /Root 1 0 R >>\n%%EOF");
+        pdf.into_bytes()
+    }
+
+    fn labels(info: &DocInfo) -> Vec<&str> {
+        info.pages.iter().map(|p| p.label.as_str()).collect()
+    }
+
+    /// `page_labels` on `pages` pages (labelled 1, 2, 3…) of `pdf`'s `/PageLabels`.
+    fn labels_on(pdf: &[u8], pages: usize) -> (Vec<String>, Result<Vec<String>, &'static str>) {
+        let doc = Document::load_mem(pdf).expect("loads");
+        let mut info: Vec<PageInfo> = (0..pages)
+            .map(|i| PageInfo { width: 200.0, height: 200.0, label: (i + 1).to_string(), crop: [0.0, 0.0, 200.0, 200.0], rotation: 0 })
+            .collect();
+        let result = Inspector::new(&doc).page_labels(doc.catalog().expect("a catalog"), &mut info);
+        (info.into_iter().map(|p| p.label).collect(), result)
+    }
+
+    #[test]
+    fn page_labels_follow_the_number_tree() {
+        let info = inspect(Arc::new(with_labels(6, "<< /Nums [0 << /S /r >> 2 << /S /D >> 4 << /S /A /P (App-) >>] >>", &[])), None).expect("opens");
+        assert_eq!(labels(&info), ["i", "ii", "1", "2", "App-A", "App-B"]);
+        assert!(info.warnings.is_empty(), "{:?}", info.warnings);
+    }
+
+    /// About 300 bytes asking for page 2^63 - 1 in letters: a label of 354,745,078,340,568,301
+    /// letters, whose allocation aborted the process (an abort, not a panic `inspect` can catch).
+    const HOSTILE_LABEL: &[u8] = b"%PDF-1.7
+1 0 obj << /Type /Catalog /Pages 2 0 R /PageLabels << /Nums [0 << /S /a /St 9223372036854775807 >>] >> >> endobj
+2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj
+3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >> endobj
+trailer << /Root 1 0 R >>
+%%EOF";
+
+    #[test]
+    fn a_hostile_page_label_number_opens_with_the_physical_page_number() {
+        let info = inspect(Arc::new(HOSTILE_LABEL.to_vec()), None).expect("opens");
+        assert_eq!(labels(&info), ["1"]);
+        assert_eq!(info.warnings, ["Page labels: the labels from page 1 are longer than 1024 bytes, so those pages show their physical numbers."]);
+    }
+
+    #[test]
+    fn every_numbering_style_takes_page_numbers_up_to_i64_max() {
+        // A range per page, each starting at 2^63 - 1: letters and Roman numerals that long
+        // aren't made; decimal digits are.
+        let max = i64::MAX;
+        let nums = format!(
+            "<< /Nums [0 << /S /a /St {max} >> 1 << /S /A /St {max} >> 2 << /S /r /St {max} >> 3 << /S /R /St {max} >> 4 << /S /D /St {max} >>] >>"
+        );
+        let info = inspect(Arc::new(with_labels(5, &nums, &[])), None).expect("opens");
+        assert_eq!(labels(&info), ["1", "2", "3", "4", "9223372036854775807"]);
+        assert_eq!(
+            info.warnings,
+            ["Page labels: the labels from page 1 and 3 other ranges are longer than 1024 bytes, so those pages show their physical numbers."]
+        );
+    }
+
+    #[test]
+    fn page_label_prefixes_and_totals_are_bounded() {
+        let x = |n: usize| "x".repeat(n);
+        // A raw prefix over 2050 bytes, a decoded one over 1024, and a prefix whose number takes
+        // the label past 1024: those pages keep their physical numbers. 1024 bytes exactly is shown.
+        let nums = format!(
+            "<< /Nums [0 << /S /D /P ({}) >> 1 << /S /D /P ({}) >> 2 << /S /D /P ({}) >> 3 << /S /D /P ({}) >>] >>",
+            x(3000),
+            x(1500),
+            x(1024),
+            x(1023)
+        );
+        let info = inspect(Arc::new(with_labels(4, &nums, &[])), None).expect("opens");
+        assert_eq!(labels(&info), ["1", "2", "3", format!("{}1", x(1023)).as_str()]);
+        assert_eq!(
+            info.warnings,
+            ["Page labels: the labels from page 1 and 2 other ranges are longer than 1024 bytes, so those pages show their physical numbers."]
+        );
+        // Labels of about 1,000 bytes on 4,200 pages: over 4 MiB in all, so none is applied.
+        let (labels, result) = labels_on(&with_labels(1, &format!("<< /Nums [0 << /S /D /P ({}) >>] >>", x(1000)), &[]), 4200);
+        assert_eq!(result, Err("the labels take more than 4 MiB in all"));
+        assert!(labels.iter().enumerate().all(|(i, l)| *l == (i + 1).to_string()), "physical numbers");
+        // One 1,000-byte prefix shared by 5,000 ranges: refused before any label is made.
+        let nums: String = (0..5000).map(|i| format!("{i} << /S /D /P 10 0 R >> ")).collect();
+        let (_, result) = labels_on(&with_labels(1, &format!("<< /Nums [{nums}] >>"), &[&format!("({})", x(1000))]), 5000);
+        assert_eq!(result, Err("the label prefixes take more than 4 MiB in all"));
+    }
+
+    #[test]
+    fn page_label_trees_are_read_once_per_node_within_a_budget() {
+        // A node naming itself three times was walked 3^32 times; each node is read once.
+        let pdf = with_labels(3, "10 0 R", &["<< /Kids [10 0 R 10 0 R 10 0 R] /Nums [0 << /S /r >>] >>"]);
+        let info = inspect(Arc::new(pdf), None).expect("opens");
+        assert_eq!(labels(&info), ["i", "ii", "iii"]);
+        assert!(info.warnings.is_empty(), "{:?}", info.warnings);
+        // 200,000 kids: past the budget for the whole tree, so no label is applied.
+        let kids = "11 0 R ".repeat(MAX_LABEL_TREE_WORK);
+        let pdf = with_labels(2, "10 0 R", &[&format!("<< /Kids [{kids}] >>"), "<< /Nums [0 << /S /r >>] >>"]);
+        let info = inspect(Arc::new(pdf), None).expect("opens");
+        assert_eq!(labels(&info), ["1", "2"]);
+        assert_eq!(info.warnings, ["Page labels were skipped: the number tree is too large; using physical page numbers."]);
     }
 
     const ATTACHMENTS: &[u8] = b"%PDF-1.7

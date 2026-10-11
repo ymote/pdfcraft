@@ -595,7 +595,7 @@ fn number_pages_like_acrobat() {
     crate::number_pages(&mut d, 2, 5, Decimal, "", 1).unwrap();
     crate::number_pages(&mut d, 4, 5, Decimal, "A-", 1).unwrap();
     assert_eq!(crate::page_labels(&d).unwrap(), ["i", "ii", "1", "2", "A-1", "A-2"]);
-    assert_eq!(crate::page_label_ranges(&d).len(), 3, "continuations are merged");
+    assert_eq!(crate::page_label_ranges(&d).unwrap().len(), 3, "continuations are merged");
     // Relabelling the middle keeps the pages after it.
     crate::number_pages(&mut d, 3, 3, UpperAlpha, "Fig ", 3).unwrap();
     assert_eq!(crate::page_labels(&d).unwrap(), ["i", "ii", "1", "Fig C", "A-1", "A-2"]);
@@ -604,8 +604,64 @@ fn number_pages_like_acrobat() {
     let back = full_roundtrip(&d);
     assert_eq!(crate::page_labels(&back).unwrap(), ["i", "ii", "1", "Fig C", "A-1", "A-2"]);
     crate::number_pages(&mut d, 0, 5, Decimal, "", 1).unwrap();
-    assert!(crate::page_label_ranges(&d).is_empty());
+    assert!(crate::page_label_ranges(&d).unwrap().is_empty());
     assert!(d.get(d.root().unwrap()).as_dict().unwrap().get(b"PageLabels").is_none());
+}
+
+/// A `pages`-page document whose catalog's `/PageLabels` is `labels`; `extra` objects are
+/// numbered from 3, after the catalog and the page tree.
+fn labelled(pages: usize, labels: &str, extra: &[String]) -> Document {
+    let first_page = 3 + extra.len();
+    let kids: Vec<String> = (0..pages).map(|i| format!("{} 0 R", first_page + i)).collect();
+    let mut objs = vec![
+        format!("<< /Type /Catalog /Pages 2 0 R /PageLabels {labels} >>"),
+        format!("<< /Type /Pages /Kids [{}] /Count {pages} /MediaBox [0 0 300 400] >>", kids.join(" ")),
+    ];
+    objs.extend(extra.iter().cloned());
+    objs.extend((0..pages).map(|_| "<< /Type /Page /Parent 2 0 R >>".to_string()));
+    let mut out = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::new();
+    for (i, o) in objs.iter().enumerate() {
+        offsets.push(out.len());
+        out.extend_from_slice(format!("{} 0 obj\n{o}\nendobj\n", i + 1).as_bytes());
+    }
+    let xref = out.len();
+    out.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", objs.len() + 1).as_bytes());
+    for o in offsets {
+        out.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", objs.len() + 1).as_bytes());
+    open(out)
+}
+
+/// Reading labels takes bounded work and memory from any file, and a tree past the bounds is
+/// refused rather than read in part, so relabelling never writes back half of it.
+#[test]
+fn hostile_page_label_trees_are_refused_not_copied() {
+    use crate::LabelStyle::*;
+    let refused = |d: &Document| crate::page_label_ranges(d).unwrap_err().to_string();
+    // A node naming itself twice is read once.
+    let d = labelled(3, "3 0 R", &["<< /Kids [3 0 R 3 0 R] /Nums [0 << /S /r >>] >>".into()]);
+    assert_eq!(crate::page_labels(&d).unwrap(), ["i", "ii", "iii"]);
+    // One range dictionary shared by 1,000 entries was copied once per entry: its 3,000-byte
+    // prefix is refused before it is decoded, and so is relabelling, which changes nothing.
+    let nums: String = (0..1000).map(|i| format!("{i} 3 0 R ")).collect();
+    let mut d = labelled(3, &format!("<< /Nums [{nums}] >>"), &[format!("<< /S /D /P ({}) >>", "x".repeat(3000))]);
+    assert!(refused(&d).contains("a prefix is longer than 2,050 bytes"), "{}", refused(&d));
+    assert!(crate::page_labels(&d).is_err());
+    assert!(crate::number_pages(&mut d, 0, 1, LowerRoman, "", 1).is_err());
+    assert!(d.modified_objects().is_empty(), "a refused relabelling changes nothing");
+    // A 2,000-byte prefix shared by 3,000 ranges: over 4 MiB of prefixes in all.
+    let nums: String = (0..3000).map(|i| format!("{i} << /S /D /P 3 0 R >> ")).collect();
+    let d = labelled(1, &format!("<< /Nums [{nums}] >>"), &[format!("({})", "x".repeat(2000))]);
+    assert!(refused(&d).contains("the prefixes take more than 4 MiB in all"), "{}", refused(&d));
+    // 200,000 kids: past the budget for the whole tree.
+    let d = labelled(1, "3 0 R", &[format!("<< /Kids [{}] >>", "4 0 R ".repeat(200_000)), "<< /Nums [0 << /S /r >>] >>".into()]);
+    assert!(refused(&d).contains("more than 200,000 entries"), "{}", refused(&d));
+    // Labels of about 2 KB on 2,200 pages: over 4 MiB in all.
+    let d = labelled(2200, &format!("<< /Nums [0 << /S /D /P ({}) >>] >>", "x".repeat(2000)), &[]);
+    let e = crate::page_labels(&d).unwrap_err().to_string();
+    assert!(e.contains("the page labels take more than 4 MiB in all"), "{e}");
 }
 
 #[test]
