@@ -7,8 +7,9 @@ use crate::data::{
     DatasetsWrite, FieldData, FieldDatum, build_data, iso_to_pattern, parse_datasets, pattern_to_iso, read_values, som_to_path, write_datasets,
 };
 use crate::data::{add_data_instances, remove_data_instance, write_data_value};
-use crate::fixtures::{scripted_template, shell, static_shell, template, template_with_data};
+use crate::fixtures::{TINY_GIF, fields_template, scripted_template, shell, static_shell, template, template_with_data, tiny_png};
 use crate::layout::Item;
+use crate::layout::WidgetKind;
 use crate::model::*;
 use crate::script::{NodeKind, Overrides, apply_overrides, fields_by_som, form_tree, overrides, rerender, set_overrides};
 
@@ -761,4 +762,714 @@ fn top_fields(doc: &Document) -> Vec<(String, pdfcraft_cos::Dict)> {
             Some((t, d))
         })
         .collect()
+}
+
+#[test]
+fn choice_lists_signatures_passwords_and_pictures_become_fields_and_images() {
+    let form = layout_xml(&fields_template("")).unwrap();
+    let p1 = &form.pages[0];
+    let w = widgets(p1);
+    let country = w.iter().find(|w| w.name == "country").unwrap();
+    assert_eq!(
+        country.kind,
+        WidgetKind::Choice {
+            options: vec![("CA".into(), "Canada".into()), ("FR".into(), "France".into()), ("JP".into(), "Japan".into())],
+            list_box: false,
+            multi: false,
+            editable: false,
+        }
+    );
+    assert_eq!(country.value.as_deref(), Some("FR"), "the template default, as a saved value");
+    let langs = w.iter().find(|w| w.name == "langs").unwrap();
+    assert!(
+        matches!(&langs.kind, WidgetKind::Choice { options, list_box: true, multi: true, editable: false } if options.len() == 3 && options[0] == ("English".into(), "English".into()))
+    );
+    let other = w.iter().find(|w| w.name == "other").unwrap();
+    assert!(matches!(&other.kind, WidgetKind::Choice { list_box: false, multi: false, editable: true, .. }));
+    assert_eq!(w.iter().find(|w| w.name == "pin").unwrap().kind, WidgetKind::Password);
+    assert_eq!(w.iter().find(|w| w.name == "sign").unwrap().kind, WidgetKind::Signature);
+    assert!(w.iter().all(|w| w.name != "photo" && w.name != "code"), "image and barcode fields make no widget");
+    // The PNG in the image field and the GIF in the draw are pictures, fitted to their boxes.
+    let images: Vec<(&Rect, usize)> =
+        p1.items.iter().filter_map(|i| if let Item::Image { rect, data, .. } = i { Some((rect, data.len())) } else { None }).collect();
+    assert_eq!(images.len(), 2, "{images:?}");
+    assert!((images[0].0.w - 72.0).abs() < 0.01 && (images[0].0.h - 72.0).abs() < 0.01, "a square picture fills a 1in square: {:?}", images[0].0);
+    assert_eq!(images[1].1, TINY_GIF.len());
+    let t = texts(p1);
+    assert!(t.iter().any(|s| s == "12345"), "the barcode's value as text: {t:?}");
+    assert!(form.warnings.iter().any(|w| w.contains("barcode")) && form.warnings.iter().any(|w| w.contains("image fields")), "{:?}", form.warnings);
+
+    // Written into the PDF: /Ch fields with their options and flags, a /Sig field, a password
+    // field, and Flate images (the PNG with a soft mask).
+    let mut doc = Document::open(Arc::new(shell(&fields_template("")))).unwrap();
+    let report = render_into(&mut doc).unwrap();
+    assert_eq!(report.fields, 6, "country, langs, other, pin, sign, summary");
+    let bytes = write_incremental(&doc, &SaveOptions::default()).unwrap();
+    let doc = Document::open(Arc::new(bytes)).unwrap();
+    let fields = pdfcraft_forms_free_fields(&doc);
+    let field = |n: &str| fields.iter().find(|(name, _)| name == n).map(|(_, d)| d.clone()).unwrap_or_else(|| panic!("no field {n}"));
+    let country = field("country");
+    assert_eq!(country.name(b"FT"), Some(b"Ch".as_slice()));
+    assert_eq!(country.int(b"Ff"), Some(1 << 17), "a combo box");
+    let opt = doc.resolve(country.get(b"Opt").unwrap()).as_array().unwrap().clone();
+    assert_eq!(opt.len(), 3);
+    let pair = doc.resolve(&opt[1]).as_array().unwrap().clone();
+    assert_eq!(pair[0].as_string().unwrap().to_text(), "FR");
+    assert_eq!(pair[1].as_string().unwrap().to_text(), "France");
+    assert_eq!(country.get(b"V").and_then(|v| v.as_string()).map(|s| s.to_text()).as_deref(), Some("FR"));
+    assert_eq!(country.get(b"DV").and_then(|v| v.as_string()).map(|s| s.to_text()).as_deref(), Some("FR"));
+    let langs = field("langs");
+    assert_eq!(langs.int(b"Ff"), Some(1 << 21), "a multi-select list box");
+    let opt = doc.resolve(langs.get(b"Opt").unwrap()).as_array().unwrap().clone();
+    assert_eq!(opt[0].as_string().unwrap().to_text(), "English", "same shown text and value: a plain string");
+    assert_eq!(field("other").int(b"Ff"), Some((1 << 17) | (1 << 18)), "an editable combo box");
+    assert_eq!(field("pin").int(b"Ff"), Some(1 << 13), "a password field");
+    assert_eq!(field("sign").name(b"FT"), Some(b"Sig".as_slice()));
+    let streams: Vec<pdfcraft_cos::Stream> = doc
+        .object_numbers()
+        .into_iter()
+        .filter_map(|n| if let Object::Stream(st) = &*doc.get(pdfcraft_cos::ObjRef { num: n, generation: 0 }) { Some(st.clone()) } else { None })
+        .filter(|s| s.dict.name(b"Subtype") == Some(b"Image"))
+        .collect();
+    assert_eq!(streams.len(), 3, "the PNG, its soft mask, the GIF");
+    let png = streams.iter().find(|s| s.dict.contains(b"SMask")).expect("the PNG has a soft mask");
+    assert_eq!(png.dict.name(b"ColorSpace"), Some(b"DeviceRGB".as_slice()));
+    assert_eq!(png.dict.name(b"Filter"), Some(b"FlateDecode".as_slice()));
+    assert_eq!(png.decoded().unwrap().len(), 12, "2 × 2 RGB samples");
+    let gif = streams.iter().find(|s| s.dict.int(b"Width") == Some(1)).expect("the 1 × 1 GIF");
+    assert_eq!(gif.dict.name(b"ColorSpace"), Some(b"DeviceGray".as_slice()), "a white pixel is gray");
+    assert_eq!(gif.decoded().unwrap(), vec![255]);
+}
+
+/// The terminal field dictionaries by name (one level: this fixture has no hierarchy).
+fn pdfcraft_forms_free_fields(doc: &Document) -> Vec<(String, pdfcraft_cos::Dict)> {
+    let root = doc.get(doc.root().unwrap());
+    let acro = doc.resolve(root.as_dict().unwrap().get(b"AcroForm").unwrap());
+    let fields = doc.resolve(acro.as_dict().unwrap().get(b"Fields").unwrap()).as_array().unwrap().clone();
+    fields
+        .iter()
+        .filter_map(|f| {
+            let d = doc.resolve(f).as_dict()?.clone();
+            let name = d.get(b"T").map(|t| doc.resolve(t)).and_then(|t| t.as_string().map(|s| s.to_text()))?;
+            Some((name, d))
+        })
+        .collect()
+}
+
+#[test]
+fn choice_values_come_from_the_data_as_saved_values_and_several_for_lists() {
+    // Shown text in the data is taken too (an editable list the user typed into saves text).
+    let xml = fields_template("<form><page1><country>Japan</country><langs>English\nSpanish</langs><other>typed</other></page1></form>");
+    let form = layout_xml(&xml).unwrap();
+    let w = widgets(&form.pages[0]);
+    assert_eq!(w.iter().find(|w| w.name == "country").unwrap().value.as_deref(), Some("JP"));
+    assert_eq!(w.iter().find(|w| w.name == "langs").unwrap().value.as_deref(), Some("English\nSpanish"));
+    assert_eq!(w.iter().find(|w| w.name == "other").unwrap().value.as_deref(), Some("typed"));
+    let mut doc = Document::open(Arc::new(shell(&xml))).unwrap();
+    render_into(&mut doc).unwrap();
+    let bytes = write_incremental(&doc, &SaveOptions::default()).unwrap();
+    let doc = Document::open(Arc::new(bytes)).unwrap();
+    let fields = pdfcraft_forms_free_fields(&doc);
+    let langs = &fields.iter().find(|(n, _)| n == "langs").unwrap().1;
+    let v = doc.resolve(langs.get(b"V").unwrap()).as_array().unwrap().clone();
+    assert_eq!(v.iter().map(|s| s.as_string().unwrap().to_text()).collect::<Vec<_>>(), vec!["English", "Spanish"]);
+    let i = doc.resolve(langs.get(b"I").unwrap()).as_array().unwrap().clone();
+    assert_eq!(i.iter().map(|o| o.as_int().unwrap()).collect::<Vec<_>>(), vec![0, 2]);
+}
+
+#[test]
+fn pictures_are_sized_from_their_headers_and_hostile_ones_are_refused_unallocated() {
+    use crate::image::{Kind, decode, kind, size};
+    assert_eq!(kind(&tiny_png()), Some(Kind::Png));
+    assert_eq!(size(&tiny_png()), Some((2, 2)));
+    assert_eq!(kind(TINY_GIF), Some(Kind::Gif));
+    assert_eq!(size(TINY_GIF), Some((1, 1)));
+    assert_eq!(kind(b"BM..."), None);
+    assert_eq!(size(b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR"), None, "a header cut short");
+    let decoded = decode(&tiny_png()).unwrap();
+    assert_eq!((decoded.width, decoded.height, decoded.color_space), (2, 2, "DeviceRGB"));
+    assert_eq!(decoded.samples, vec![255, 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0]);
+    assert_eq!(decoded.alpha, Some(vec![255, 255, 255, 0]));
+    assert_eq!(decode(TINY_GIF).unwrap().samples, vec![255]);
+    // A PNG claiming 100,000 × 100,000 pixels is refused from its header, before any buffer.
+    let mut huge = tiny_png();
+    huge[16..20].copy_from_slice(&100_000u32.to_be_bytes());
+    huge[20..24].copy_from_slice(&100_000u32.to_be_bytes());
+    assert_eq!(size(&huge), None, "no size for layout: the box is used");
+    assert!(decode(&huge).unwrap_err().contains("million pixels"));
+    // Truncated and corrupt data are errors, not panics.
+    let cut = &tiny_png()[..30];
+    assert!(decode(cut).is_err());
+    let mut bad = tiny_png();
+    for b in bad.iter_mut().skip(40) {
+        *b ^= 0x55;
+    }
+    assert!(decode(&bad).is_err() || decode(&bad).is_ok());
+    let mut gif = TINY_GIF.to_vec();
+    gif.truncate(12);
+    assert!(decode(&gif).is_err());
+    // A form whose picture is broken still lays out, with a warning, and keeps the rest.
+    let xml = fields_template("")
+        .replace("image/gif", "image/gif\" transferEncoding=\"none")
+        .replace("<image contentType=\"image/png\">", "<image contentType=\"image/png\">AAAA");
+    let mut doc = Document::open(Arc::new(shell(&xml))).unwrap();
+    let report = render_into(&mut doc).unwrap();
+    assert_eq!(report.fields, 6);
+    assert!(report.warnings.iter().any(|w| w.contains("image")), "{:?}", report.warnings);
+}
+
+#[test]
+fn choice_values_are_saved_values_first_deduplicated_and_defaults_are_saved_values_too() {
+    // Designer's "specify item values": shown 0..3, saved 1..4. The data's 1 means the item
+    // shown as 0, not the item shown as 1.
+    let tpl = fields_template("<form><page1><country>1</country></page1></form>")
+        .replace("<text>Canada</text><text>France</text><text>Japan</text>", "<text>0</text><text>1</text><text>2</text><text>3</text>")
+        .replace("<text>CA</text><text>FR</text><text>JP</text>", "<text>1</text><text>2</text><text>3</text><text>4</text>")
+        .replace("<value><text>FR</text></value></field>", "<value><text>1</text></value></field>");
+    let form = layout_xml(&tpl).unwrap();
+    let w = widgets(&form.pages[0]);
+    assert_eq!(w.iter().find(|w| w.name == "country").unwrap().value.as_deref(), Some("1"));
+    let (t, _) = parse(&tpl).unwrap();
+    let tree = form_tree(&t, parse_datasets(&tpl).as_ref(), &Overrides::default());
+    let node = tree.root.children.iter().find(|n| n.name == "page1").unwrap().children.iter().find(|n| n.name == "country").unwrap();
+    assert_eq!(node.value, "1", "scripts read the saved value");
+    // Several values: each once, never more than there are items, written as ascending indices;
+    // a single-select list takes the first line; defaults are saved values.
+    let tpl = fields_template("<form><page1><country>Japan\nCanada</country><langs>Spanish\nEnglish\nEnglish\nSpanish</langs></page1></form>")
+        .replace("<value><text>FR</text></value></field>", "<value><text>France</text></value></field>")
+        .replace(
+            "<items><text>English</text><text>French</text><text>Spanish</text></items>",
+            "<items><text>English</text><text>French</text><text>Spanish</text></items><value><text>English\nFrench</text></value>",
+        );
+    let form = layout_xml(&tpl).unwrap();
+    let w = widgets(&form.pages[0]);
+    assert_eq!(w.iter().find(|w| w.name == "langs").unwrap().value.as_deref(), Some("Spanish\nEnglish"));
+    assert_eq!(w.iter().find(|w| w.name == "country").unwrap().value.as_deref(), Some("JP"));
+    assert_eq!(w.iter().find(|w| w.name == "country").unwrap().default.as_deref(), Some("FR"));
+    let mut doc = Document::open(Arc::new(shell(&tpl))).unwrap();
+    render_into(&mut doc).unwrap();
+    let doc = Document::open(Arc::new(write_incremental(&doc, &SaveOptions::default()).unwrap())).unwrap();
+    let fields = pdfcraft_forms_free_fields(&doc);
+    let langs = &fields.iter().find(|(n, _)| n == "langs").unwrap().1;
+    let i = doc.resolve(langs.get(b"I").unwrap()).as_array().unwrap().clone();
+    assert_eq!(i.iter().map(|o| o.as_int().unwrap()).collect::<Vec<_>>(), vec![0, 2]);
+    let dv = doc.resolve(langs.get(b"DV").unwrap()).as_array().unwrap().clone();
+    assert_eq!(dv.iter().map(|s| s.as_string().unwrap().to_text()).collect::<Vec<_>>(), vec!["English", "French"]);
+    let country = &fields.iter().find(|(n, _)| n == "country").unwrap().1;
+    assert_eq!(country.get(b"DV").and_then(|v| v.as_string()).map(|s| s.to_text()).as_deref(), Some("FR"));
+    assert_eq!(doc.resolve(country.get(b"I").unwrap()).as_array().unwrap().len(), 1);
+    // Picks stored as <value> children are read too.
+    let tpl = fields_template("<form><page1><langs><value>English</value><value>Spanish</value></langs></page1></form>");
+    let form = layout_xml(&tpl).unwrap();
+    assert_eq!(widgets(&form.pages[0]).iter().find(|w| w.name == "langs").unwrap().value.as_deref(), Some("English\nSpanish"));
+    // More items than the cap: kept to the cap, and said so.
+    let many: String = (0..1500).map(|i| format!("<text>i{i}</text>")).collect();
+    let tpl = fields_template("").replace("<items><text>A</text><text>B</text></items>", &format!("<items>{many}</items>"));
+    let form = layout_xml(&tpl).unwrap();
+    let other = widgets(&form.pages[0]).into_iter().find(|w| w.name == "other").unwrap();
+    assert!(matches!(&other.kind, WidgetKind::Choice { options, .. } if options.len() == 1000));
+    assert!(form.warnings.iter().any(|w| w.contains("other") && w.contains("1000 items")), "{:?}", form.warnings);
+}
+
+#[test]
+fn pictures_are_embedded_once_across_relayouts_and_bad_data_pictures_are_reported() {
+    use crate::image::{decode, size};
+    let tpl = fields_template("<form><page1><country>JP</country></page1></form>");
+    let mut doc = Document::open(Arc::new(shell(&tpl))).unwrap();
+    render_into(&mut doc).unwrap();
+    let (t, _) = parse(&tpl).unwrap();
+    rerender(&mut doc, &t).unwrap();
+    rerender(&mut doc, &t).unwrap();
+    let bytes = write_incremental(&doc, &SaveOptions::default()).unwrap();
+    let doc = Document::open(Arc::new(bytes)).unwrap();
+    let images = doc
+        .object_numbers()
+        .into_iter()
+        .filter(
+            |n| matches!(&*doc.get(pdfcraft_cos::ObjRef { num: *n, generation: 0 }), Object::Stream(s) if s.dict.name(b"Subtype") == Some(b"Image")),
+        )
+        .count();
+    assert_eq!(images, 3, "the PNG, its soft mask and the GIF, however many times the form was laid out");
+    // No private map in the catalog: earlier pictures are found on the pages, by their hash.
+    let root = doc.get(doc.root().unwrap());
+    assert!(!root.as_dict().unwrap().contains(b"PCXfaImages"));
+    // Pictures in the data that aren't pictures: a warning naming the field, the template's
+    // picture shown instead.
+    for (data, what) in [("Qk0AAAAA", "not a JPEG, PNG or GIF"), ("not base64!", "not base64")] {
+        let tpl = fields_template(&format!("<form><page1><photo>{data}</photo></page1></form>"));
+        let form = layout_xml(&tpl).unwrap();
+        assert!(form.warnings.iter().any(|w| w.contains("photo") && w.contains(what)), "{what}: {:?}", form.warnings);
+        assert_eq!(form.pages[0].items.iter().filter(|i| matches!(i, Item::Image { .. })).count(), 2);
+    }
+    // A hostile PNG header: no size for layout (the draw keeps its box), refused at decode.
+    let mut tall = tiny_png();
+    tall[16..20].copy_from_slice(&1u32.to_be_bytes());
+    tall[20..24].copy_from_slice(&4_000_000_000u32.to_be_bytes());
+    assert_eq!(size(&tall), None);
+    assert!(decode(&tall).unwrap_err().contains("million pixels"));
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&tall);
+    let tpl = fields_template("").replace(
+        r#"<draw name="logo" w="0.5in" h="0.5in">"#,
+        &format!(
+            r#"<draw name="tall" w="2in"><value><image contentType="image/png">{b64}</image></value></draw><draw name="logo" w="0.5in" h="0.5in">"#
+        ),
+    );
+    let form = layout_xml(&tpl).unwrap();
+    assert_eq!(form.pages.len(), 1, "a picture of unknown size takes its box, not a page");
+    // A GIF whose frame is far larger than its 1 × 1 screen is refused before it is allocated.
+    let mut gif = b"GIF89a\x01\x00\x01\x00\x80\x00\x00\xff\xff\xff\x00\x00\x00,\x00\x00\x00\x00".to_vec();
+    gif.extend_from_slice(&11_000u16.to_le_bytes());
+    gif.extend_from_slice(&11_000u16.to_le_bytes());
+    gif.extend_from_slice(b"\x00\x02\x02D\x01\x00;");
+    let started = std::time::Instant::now();
+    assert!(decode(&gif).unwrap_err().contains("million pixels"));
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    // A template picture over 1 MiB is read whole (text is cut at 1 MiB, pictures are not).
+    let big = "A".repeat(1_600_000);
+    let tpl = fields_template("").replace(r#"<image contentType="image/gif">"#, &format!(r#"<image contentType="image/gif">{big}"#));
+    let (t, _) = parse(&tpl).unwrap();
+    fn find_image(nodes: &[Node]) -> Option<usize> {
+        nodes.iter().find_map(|n| match n {
+            Node::Draw(d) => match &d.value {
+                Value::Image { data, .. } => Some(data.len()),
+                _ => None,
+            },
+            Node::Subform(s) => find_image(&s.children),
+            _ => None,
+        })
+    }
+    assert!(find_image(&t.root.children).is_some_and(|n| n > 1_200_000));
+}
+
+/// A repeating subform drawn inside positioned content (a top-to-bottom table in an area of a
+/// positioned subform) gets its `occur` instances, as in Adobe's viewers: real Designer forms
+/// have tables like this whose calculations read every row. Before, only one row was laid
+/// out, and the field after the table was placed as if there were one.
+#[test]
+fn repeating_subforms_inside_positioned_content_get_their_instances() {
+    let xdp = r##"<?xml version="1.0" encoding="UTF-8"?>
+<xdp:xdp xmlns:xdp="http://ns.adobe.com/xdp/">
+<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/">
+<subform name="form" layout="tb">
+ <pageSet><pageArea name="front"><contentArea x="0.5in" y="0.5in" w="7.5in" h="10in"/><medium short="8.5in" long="11in"/></pageArea></pageSet>
+ <subform name="page1" w="7.5in" h="8in">
+  <area name="box" x="0.5in" y="1in">
+   <subform name="wrap" layout="tb" w="4in">
+    <subform name="table" layout="tb" w="4in">
+     <subform name="row" w="4in" h="0.3in"><occur min="3" max="-1"/>
+      <field name="reason" w="4in" h="0.3in"><ui><textEdit/></ui></field>
+     </subform>
+    </subform>
+    <field name="after" w="4in" h="0.3in"><ui><textEdit/></ui></field>
+   </subform>
+  </area>
+ </subform>
+</subform>
+</template>
+</xdp:xdp>
+"##;
+    let form = layout_xml(xdp).unwrap();
+    let all: Vec<&Widget> = form.pages.iter().flat_map(widgets).collect();
+    let rows: Vec<&Widget> = all.iter().copied().filter(|w| w.som.ends_with(".reason[0]")).collect();
+    let soms: Vec<&str> = rows.iter().map(|w| w.som.as_str()).collect();
+    assert_eq!(
+        soms,
+        [
+            "form[0].page1[0].box[0].wrap[0].table[0].row[0].reason[0]",
+            "form[0].page1[0].box[0].wrap[0].table[0].row[1].reason[0]",
+            "form[0].page1[0].box[0].wrap[0].table[0].row[2].reason[0]",
+        ],
+        "one widget per instance, each with its own SOM index"
+    );
+    // The rows are stacked, not drawn on top of each other…
+    let step = rows[1].rect.y - rows[0].rect.y;
+    assert!(step.abs() > 1.0, "rows overlap: {:?}", rows.iter().map(|w| w.rect).collect::<Vec<_>>());
+    assert!(((rows[2].rect.y - rows[1].rect.y) - step).abs() < 0.01, "rows are evenly spaced");
+    // …and what follows the table is placed after all of them (the table was measured with
+    // its instances, not with one row).
+    let after = all.iter().find(|w| w.som.ends_with(".after[0]")).expect("the field after the table");
+    assert!(((after.rect.y - rows[2].rect.y) - step).abs() < 0.01, "after: {:?}, last row: {:?}", after.rect, rows[2].rect);
+}
+
+/// Areas are named in SOM expressions but are not data scopes; unnamed subforms and areas have
+/// no segment at all. What the template doesn't have is kept as it is.
+#[test]
+fn data_paths_leave_areas_out() {
+    let (tpl, _) = parse(&crate::fixtures::leave_template("")).unwrap();
+    let path = |som: &str| data_path(&tpl, som).into_iter().map(|(n, i)| format!("{n}[{i}]")).collect::<Vec<_>>().join(".");
+    // The area `box` (inside an unnamed subform) is dropped; indexes are kept.
+    assert_eq!(path("form[0].page[0].box[0].table[0].row[2].days[0]"), "form[0].page[0].table[0].row[2].days[0]");
+    assert_eq!(path("form[0].page[0].box[0].rest[0]"), "form[0].page[0].rest[0]");
+    // No area on the way: as som_to_path.
+    assert_eq!(path("form[0].page[0]"), "form[0].page[0]");
+    // Unknown segments, past a leaf, or a SOM from another template: kept.
+    assert_eq!(path("form[0].page[0].box[0].nothing[0].x[1]"), "form[0].page[0].nothing[0].x[1]");
+    assert_eq!(path("form[0].page[0].box[0].rest[0].box[0]"), "form[0].page[0].rest[0].box[0]");
+    assert_eq!(path("other[0].box[0].rest[0]"), "other[0].box[0].rest[0]");
+    assert_eq!(data_path(&tpl, ""), Vec::new());
+}
+
+/// A form of one page area (7.5in × 10in of content from 0.5in) around `body`.
+fn one_area_form(root_attrs: &str, body: &str) -> String {
+    format!(
+        r##"<?xml version="1.0" encoding="UTF-8"?>
+<xdp:xdp xmlns:xdp="http://ns.adobe.com/xdp/">
+<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/">
+<subform name="form" {root_attrs}>
+ <pageSet><pageArea name="page"><contentArea x="0.5in" y="0.5in" w="7.5in" h="10in"/><medium short="8.5in" long="11in"/></pageArea></pageSet>
+{body}
+</subform>
+</template>
+</xdp:xdp>
+"##
+    )
+}
+
+/// Every field is inside the content area of its page, and the fields come in template order.
+fn assert_paginated(form: &Form, fields: usize, min_pages: usize) {
+    assert!(form.pages.len() >= min_pages, "{} pages", form.pages.len());
+    let mut names = Vec::new();
+    for (i, p) in form.pages.iter().enumerate() {
+        for w in widgets(p) {
+            assert!(
+                w.rect.y >= 36.0 - 0.01 && w.rect.bottom() <= 36.0 + 720.0 + 0.01,
+                "page {}: {} is outside the content area: {:?}",
+                i + 1,
+                w.name,
+                w.rect
+            );
+            names.push(w.som.clone());
+        }
+    }
+    assert_eq!(names.len(), fields, "{names:?}");
+    let expected: Vec<String> = (0..fields).map(|i| format!("f{i}[0]")).collect();
+    for (n, e) in names.iter().zip(&expected) {
+        assert!(n.ends_with(e), "{n} where {e} belongs: {names:?}");
+    }
+}
+
+#[test]
+fn a_positioned_subform_taller_than_a_page_continues_on_the_next_pages() {
+    // 30 fields 0.9in apart: 27in of positioned content, where a content area holds 10in.
+    let fields: String =
+        (0..30).map(|i| format!(r#"<field name="f{i}" x="0.5in" y="{}in" w="4in" h="0.4in"><ui><textEdit/></ui></field>"#, i as f64 * 0.9)).collect();
+    // As the only child of a flowed root …
+    let form = layout_xml(&one_area_form(
+        r#"layout="tb""#,
+        &format!(r#"<subform name="body"><border><fill><color value="200,200,200"/></fill></border>{fields}</subform>"#),
+    ))
+    .unwrap();
+    assert_paginated(&form, 30, 3);
+    // … its fill is cut at the breaks, a piece on every page, none past the content area.
+    for (i, p) in form.pages.iter().enumerate() {
+        let fills: Vec<&Rect> = p.items.iter().filter_map(|it| if let Item::Fill { rect, .. } = it { Some(rect) } else { None }).collect();
+        assert!(!fills.is_empty(), "page {}: no fill", i + 1);
+        for r in fills {
+            assert!(r.bottom() <= 36.0 + 720.0 + 0.01, "page {}: fill {r:?}", i + 1);
+        }
+    }
+    // … after other content on the page …
+    let form = layout_xml(&one_area_form(
+        r#"layout="tb""#,
+        &format!(r#"<draw name="head" w="4in" h="3in"><value><text>Head</text></value></draw><subform name="body">{fields}</subform>"#),
+    ))
+    .unwrap();
+    assert_paginated(&form, 30, 3);
+    assert!(!widgets(&form.pages[0]).is_empty(), "the block starts on the page the heading is on");
+    // … and as the root itself (positioned is the default layout).
+    let form = layout_xml(&one_area_form("", &fields)).unwrap();
+    assert_paginated(&form, 30, 3);
+}
+
+#[test]
+fn wrapped_and_fixed_height_blocks_taller_than_a_page_are_split_too() {
+    let fields: String = (0..60).map(|i| format!(r#"<field name="f{i}" w="3.5in" h="0.8in"><ui><textEdit/></ui></field>"#)).collect();
+    // Left-to-right wrapping: 30 lines of 0.8in.
+    let form = layout_xml(&one_area_form(r#"layout="tb""#, &format!(r#"<subform name="body" layout="lr-tb" w="7.5in">{fields}</subform>"#))).unwrap();
+    assert_paginated(&form, 60, 3);
+    // Top-to-bottom with a fixed height the content outgrows.
+    let form =
+        layout_xml(&one_area_form(r#"layout="tb""#, &format!(r#"<subform name="body" layout="tb" w="7.5in" h="9in">{fields}</subform>"#))).unwrap();
+    assert_paginated(&form, 60, 5);
+}
+
+#[test]
+fn a_block_that_fits_a_page_is_still_moved_whole() {
+    let block = |n: usize| {
+        format!(r#"<subform name="b{n}" w="7in" h="6in"><field name="f{n}" x="0in" y="5in" w="4in" h="0.4in"><ui><textEdit/></ui></field></subform>"#)
+    };
+    let form = layout_xml(&one_area_form(r#"layout="tb""#, &format!("{}{}{}", block(0), block(1), block(2)))).unwrap();
+    assert_eq!(form.pages.len(), 3);
+    for p in &form.pages {
+        let w = widgets(p);
+        assert_eq!(w.len(), 1);
+        assert!((w[0].rect.y - (36.0 + 360.0)).abs() < 0.01, "{:?}", w[0].rect);
+    }
+}
+
+#[test]
+fn a_field_taller_than_a_page_is_cut_through_without_looping() {
+    let body = r#"<field name="f0" w="4in" h="25in"><ui><textEdit/></ui></field><field name="f1" w="4in" h="0.4in"><ui><textEdit/></ui></field>"#;
+    let form = layout_xml(&one_area_form(r#"layout="tb""#, body)).unwrap();
+    let all: Vec<&Widget> = form.pages.iter().flat_map(widgets).collect();
+    assert_eq!(all.len(), 2);
+    assert!(form.pages.len() <= 4, "{} pages", form.pages.len());
+}
+
+/// A form built the way Designer builds a flowed one: everything in one left-to-right wrapped
+/// body, sections of a heading over repeating rows of fields, and a text field that grows.
+fn wrapped_form(data: &str) -> String {
+    let body = r#"<subform name="body" layout="lr-tb" w="7.5in">
+  <subform name="section" layout="lr-tb" w="7.5in" minH="0.5in">
+   <draw name="heading" w="7.5in" h="0.2in"><value><text>Entries</text></value></draw>
+   <subform name="row" layout="lr-tb" w="7.5in" minH="0.5in"><occur max="-1"/>
+    <field name="what" w="3.5in" h="1in"><ui><textEdit multiLine="1"/></ui></field>
+    <field name="when" w="0.5in" h="1in"><ui><textEdit/></ui></field>
+    <field name="why" w="3.5in" h="1in"><ui><textEdit multiLine="1"/></ui></field>
+   </subform>
+  </subform>
+  <field name="notes" w="7.5in" minH="1.5in"><ui><textEdit multiLine="1"/></ui></field>
+  <field name="after" w="7.5in" h="0.3in"><ui><textEdit/></ui></field>
+ </subform>"#;
+    let form = one_area_form(r#"layout="tb""#, body);
+    let packet =
+        format!("<xfa:datasets xmlns:xfa=\"http://www.xfa.org/schema/xfa-data/1.0/\"><xfa:data>{data}</xfa:data></xfa:datasets>\n</xdp:xdp>");
+    form.replace("</xdp:xdp>", &packet)
+}
+
+#[test]
+fn repeating_rows_in_a_wrapped_container_get_the_instances_the_data_holds() {
+    let rows: String = (0..4).map(|i| format!("<row><what>what {i}</what><when>{i}</when><why>why {i}</why></row>")).collect();
+    let form = layout_xml(&wrapped_form(&format!("<form><body><section>{rows}</section><notes>n</notes></body></form>"))).unwrap();
+    let all: Vec<&Widget> = form.pages.iter().flat_map(widgets).collect();
+    let whats: Vec<(&str, Option<&str>, f64)> =
+        all.iter().filter(|w| w.som.ends_with(".what[0]")).map(|w| (w.som.as_str(), w.value.as_deref(), w.rect.y)).collect();
+    assert_eq!(whats.len(), 4, "{whats:?}");
+    for (i, (som, value, _)) in whats.iter().enumerate() {
+        assert_eq!(*som, format!("form[0].body[0].section[0].row[{i}].what[0]"));
+        assert_eq!(*value, Some(format!("what {i}").as_str()));
+    }
+    // One under another, the section growing with them: what follows comes after the last.
+    assert!(whats.windows(2).all(|p| (p[1].2 - p[0].2 - 72.0).abs() < 0.01), "{whats:?}");
+    let notes = all.iter().find(|w| w.name == "notes").unwrap();
+    assert!(notes.rect.y >= whats[3].2 + 72.0 - 0.01, "{:?} after {whats:?}", notes.rect);
+    // Without data a row is there once.
+    let form = layout_xml(&wrapped_form("<form/>")).unwrap();
+    assert_eq!(form.pages.iter().flat_map(widgets).filter(|w| w.name.starts_with("what")).count(), 1);
+}
+
+#[test]
+fn a_multi_line_field_without_a_height_grows_to_hold_its_text() {
+    let place = |data: &str| {
+        let form = layout_xml(&wrapped_form(data)).unwrap();
+        let on = |name: &str| {
+            form.pages.iter().enumerate().find_map(|(i, p)| widgets(p).into_iter().find(|w| w.name == name).map(|w| (i, w.rect))).unwrap()
+        };
+        (on("notes"), on("after"))
+    };
+    // Little text: the minimum height.
+    let ((_, notes), (_, after)) = place("<form><body><notes>Short.</notes></body></form>");
+    assert!((notes.h - 108.0).abs() < 0.01, "{notes:?}");
+    assert!((after.y - notes.bottom()).abs() < 0.01);
+    // Forty lines: the field holds them, and what follows moves down.
+    let long: String = (0..40).map(|i| format!("Line {i} of the notes.\n")).collect();
+    let ((notes_page, grown), (after_page, after)) = place(&format!("<form><body><notes>{long}</notes></body></form>"));
+    assert!(grown.h > 40.0 * 11.0 && grown.h < 720.0, "{grown:?}");
+    assert_eq!(notes_page, after_page);
+    assert!((after.y - grown.bottom()).abs() < 0.01, "{after:?} after {grown:?}");
+    // A fixed height stays what it is.
+    let fixed = wrapped_form(&format!("<form><body><notes>{long}</notes></body></form>"))
+        .replace(r#"minH="1.5in"><ui><textEdit multiLine"#, r#"h="1.5in"><ui><textEdit multiLine"#);
+    let form = layout_xml(&fixed).unwrap();
+    let notes = form.pages.iter().flat_map(widgets).find(|w| w.name == "notes").unwrap();
+    assert!((notes.rect.h - 108.0).abs() < 0.01, "{:?}", notes.rect);
+}
+
+#[test]
+fn a_page_break_keeps_a_fields_border_with_the_field() {
+    // 6in of heading, then a bordered 5in field: it doesn't fit the 10in area and moves to
+    // the next page whole, leaving no piece of its border behind.
+    let body = r#"<subform name="body" layout="lr-tb" w="7.5in">
+  <draw name="head" w="7.5in" h="6in"><value><text>Head</text></value></draw>
+  <field name="f0" w="7.5in" h="5in"><border><edge/><fill><color value="230,230,230"/></fill></border><ui><textEdit multiLine="1"/></ui></field>
+  <field name="f1" w="7.5in" h="0.4in"><ui><textEdit/></ui></field>
+ </subform>"#;
+    let form = layout_xml(&one_area_form(r#"layout="tb""#, body)).unwrap();
+    assert_paginated(&form, 2, 2);
+    let below_head = |it: &&Item| match it {
+        Item::Fill { rect, .. } => rect.bottom() > 36.0 + 432.0 + 1.0,
+        Item::Line { from, to, .. } => from.1.max(to.1) > 36.0 + 432.0 + 1.0,
+        _ => false,
+    };
+    assert_eq!(form.pages[0].items.iter().filter(below_head).count(), 0, "{:?}", form.pages[0].items);
+    assert!(
+        form.pages[1].items.iter().any(|it| matches!(it, Item::Fill { rect, .. } if (rect.y - 36.0).abs() < 0.01 && (rect.h - 360.0).abs() < 0.01))
+    );
+}
+
+#[test]
+fn text_too_long_for_its_fixed_height_is_drawn_smaller_instead_of_over_what_follows() {
+    let words = "certification statement wording ".repeat(12);
+    let body = format!(
+        r#"<draw name="note" w="7.5in" h="0.3in"><font typeface="Arial" size="8pt"/><value><text>{words}</text></value></draw>
+ <draw name="short" w="7.5in" h="0.3in"><font typeface="Arial" size="8pt"/><value><text>Short</text></value></draw>"#
+    );
+    let form = layout_xml(&one_area_form(r#"layout="tb""#, &body)).unwrap();
+    let spans: Vec<&crate::text::Span> = form.pages[0].items.iter().filter_map(|i| if let Item::Text(s) = i { Some(s) } else { None }).collect();
+    let (short, note): (Vec<_>, Vec<_>) = spans.into_iter().partition(|s| s.text == "Short");
+    // Three lines at 8pt need 27.6pt; the box is 21.6pt high.
+    assert!(note.iter().all(|s| s.face.size < 8.0 && s.face.size >= 5.6), "{:?}", note.iter().map(|s| s.face.size).collect::<Vec<_>>());
+    assert!(note.iter().all(|s| s.baseline <= 36.0 + 21.6 + 0.5), "{:?}", note.iter().map(|s| s.baseline).collect::<Vec<_>>());
+    assert!(note.iter().all(|s| s.x + s.face.width(&s.text) <= 36.0 + 540.0 + 0.5));
+    // Text that fits keeps its size.
+    assert!((short[0].face.size - 8.0).abs() < 1e-9);
+}
+
+#[test]
+fn a_text_field_that_outgrows_a_page_continues_on_the_next_as_text() {
+    let long: String = (0..150).map(|i| format!("Line {i} of the notes.\n")).collect();
+    let form = layout_xml(&wrapped_form(&format!("<form><body><notes>{long}</notes><after>end</after></body></form>"))).unwrap();
+    assert!(form.pages.len() >= 3, "{} pages", form.pages.len());
+    assert!(form.warnings.iter().any(|w| w.starts_with("notes: its text is longer than a page")), "{:?}", form.warnings);
+    // Every line is there, in order, inside the content area of its page; no widget holds it.
+    let mut lines = Vec::new();
+    for (i, p) in form.pages.iter().enumerate() {
+        for it in &p.items {
+            if let Item::Text(s) = it
+                && s.text.starts_with("Line ")
+            {
+                assert!(s.baseline > 36.0 && s.baseline <= 36.0 + 720.0 + 0.01, "page {}: {:?} at {}", i + 1, s.text, s.baseline);
+                lines.push(s.text.clone());
+            }
+        }
+        assert!(widgets(p).iter().all(|w| w.name != "notes"));
+    }
+    assert_eq!(lines, (0..150).map(|i| format!("Line {i} of the notes.")).collect::<Vec<_>>());
+    // What follows comes after the last line, on the last page.
+    let last = form.pages.last().unwrap();
+    let after = widgets(last).into_iter().find(|w| w.name == "after").unwrap();
+    let last_line = last.items.iter().filter_map(|it| if let Item::Text(s) = it { Some(s.baseline) } else { None }).fold(0.0, f64::max);
+    assert!(after.rect.y >= last_line - 0.01 && after.rect.bottom() <= 36.0 + 720.0 + 0.01, "{:?} after {last_line}", after.rect);
+}
+
+#[test]
+fn the_form_packet_restores_the_presence_and_access_the_form_was_saved_with() {
+    // Three rows hidden in the template; a script showed the first two before the form was
+    // saved, and locked a field.
+    let row = |n: usize, presence: &str| {
+        format!(
+            r#"<subform name="row{n}" layout="lr-tb" w="7.5in"{presence}><field name="who" w="3in" h="0.4in"><ui><textEdit/></ui></field></subform>"#
+        )
+    };
+    let body = format!(
+        r#"<subform name="body" layout="lr-tb" w="7.5in">{}{}{}{}<subform name="rep" layout="lr-tb" w="7.5in"><occur max="-1"/><field name="x" w="3in" h="0.4in"><ui><textEdit/></ui></field></subform></subform>"#,
+        row(0, ""),
+        row(1, r#" presence="hidden""#),
+        row(2, r#" presence="hidden""#),
+        row(3, r#" presence="hidden""#)
+    );
+    let template = one_area_form(r#"layout="tb""#, &body);
+    let visible = |xdp: &str| -> Vec<String> { layout_xml(xdp).unwrap().pages.iter().flat_map(widgets).map(|w| w.som.clone()).collect() };
+    assert_eq!(visible(&template), ["form[0].body[0].row0[0].who[0]", "form[0].body[0].rep[0].x[0]"]);
+    let saved = r#"<form xmlns="http://www.xfa.org/schema/xfa-form/2.8/" checksum="x"><subform name="form">
+ <instanceManager name="_body"/>
+ <subform name="body">
+  <subform name="row0"><field name="who" access="readOnly"/></subform>
+  <subform name="row1" presence="visible"><field name="who" access="readOnly"><value override="1"/></field></subform>
+  <subform name="row2" presence="visible"/>
+  <subform name="row3" presence="hidden"/>
+  <subform name="rep"><field name="x"/></subform>
+  <subform name="rep" presence="hidden"><field name="x" access="readOnly"/></subform>
+  <subform name="nowhere" presence="hidden"/>
+ </subform>
+ <pageSet><pageArea name="page"/></pageSet>
+</subform></form>
+</xdp:xdp>"#;
+    let xdp = template.replace("</xdp:xdp>", saved);
+    assert_eq!(
+        visible(&xdp),
+        ["form[0].body[0].row0[0].who[0]", "form[0].body[0].row1[0].who[0]", "form[0].body[0].row2[0].who[0]", "form[0].body[0].rep[0].x[0]"],
+        "a later instance of a repeating subform says nothing about the template's one"
+    );
+    let form = layout_xml(&xdp).unwrap();
+    let locked: Vec<bool> = form.pages.iter().flat_map(widgets).map(|w| w.read_only).collect();
+    assert_eq!(locked, [true, true, false, false]);
+}
+
+#[test]
+fn a_flowed_subform_is_as_tall_as_its_content_whatever_its_minimum_height() {
+    // A bar with a stale 3in `minH` holds one 0.2in line; the row after it follows directly.
+    let body = |bar: &str| {
+        format!(
+            r#"<subform name="body" layout="lr-tb" w="7.5in"><subform name="bar" {bar} w="7.5in" minH="3in"><draw w="7.5in" h="0.2in"><value><text>Attachments</text></value></draw></subform><field name="who" w="3in" h="0.4in"><ui><textEdit/></ui></field></subform>"#
+        )
+    };
+    let top = |bar: &str| {
+        let form = layout_xml(&one_area_form(r#"layout="tb""#, &body(bar))).unwrap();
+        let w = widgets(&form.pages[0]);
+        w[0].rect.y
+    };
+    let flowed = top(r#"layout="lr-tb""#);
+    assert!((top(r#"layout="tb""#) - flowed).abs() < 0.01);
+    // A positioned subform keeps its minimum: nothing else says how tall it is.
+    assert!((top("") - flowed - (216.0 - 14.4)).abs() < 0.01, "{} against {flowed}", top(""));
+}
+
+#[test]
+fn the_form_packet_restores_a_caption_a_script_changed() {
+    let body = r#"<subform name="body" layout="tb" w="7.5in"><field name="bar" w="2in" h="0.3in"><ui><button/></ui><caption><value><text>Show Bar</text></value></caption></field></subform>"#;
+    let template = one_area_form(r#"layout="tb""#, body);
+    let caption = |xdp: &str| match &widgets(&layout_xml(xdp).unwrap().pages[0])[0].kind {
+        WidgetKind::Button { caption } => caption.clone(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(caption(&template), "Show Bar");
+    let saved = r#"<form xmlns="http://www.xfa.org/schema/xfa-form/2.8/"><subform name="form"><subform name="body">
+ <field name="bar"><caption><value><text>Hide Bar</text></value></caption></field>
+</subform></subform></form>
+</xdp:xdp>"#;
+    assert_eq!(caption(&template.replace("</xdp:xdp>", saved)), "Hide Bar");
+}
+
+#[test]
+fn a_text_field_without_a_border_of_its_own_has_no_box() {
+    let body = r#"<subform name="body" layout="tb" w="7.5in"><field name="plain" w="3in" h="0.4in"><ui><textEdit/></ui></field><field name="boxed" w="3in" h="0.4in"><ui><textEdit><border><edge/></border></textEdit></ui></field><field name="tick" w="3in" h="0.4in"><ui><checkButton/></ui></field></subform>"#;
+    let form = layout_xml(&one_area_form(r#"layout="tb""#, body)).unwrap();
+    let shapes: Vec<BorderShape> = widgets(&form.pages[0]).iter().map(|w| w.border.shape).collect();
+    assert_eq!(shapes, [BorderShape::None, BorderShape::Full, BorderShape::Full]);
+}
+
+#[test]
+fn a_signed_signature_box_shows_the_signature_the_file_holds() {
+    let mut doc = Document::open(Arc::new(crate::fixtures::signed_shell())).unwrap();
+    render_into(&mut doc).unwrap();
+    let catalog = doc.get(doc.root().unwrap());
+    let acro = doc.resolve(catalog.as_dict().unwrap().get(b"AcroForm").unwrap());
+    let fields = doc.resolve(acro.as_dict().unwrap().get(b"Fields").unwrap()).as_array().unwrap().clone();
+    let laid: Vec<_> = fields.iter().map(|f| doc.resolve(f)).filter(|f| f.as_dict().unwrap().contains(SOM_KEY)).collect();
+    let (signed, unsigned) = (laid[0].as_dict().unwrap(), laid[1].as_dict().unwrap());
+    // The signature dictionary and the picture are the file's own objects, not copies.
+    let value = doc.resolve(signed.get(b"V").unwrap());
+    assert_eq!(value.as_dict().unwrap().name(b"Type"), Some(&b"Sig"[..]));
+    assert!(signed.get(b"V").unwrap().as_ref().is_some());
+    let shown = doc.resolve(signed.get(b"AP").unwrap());
+    let picture = doc.resolve(shown.as_dict().unwrap().get(b"N").unwrap());
+    assert!(matches!(&*picture, Object::Stream(s) if s.dict.name(b"Subtype") == Some(&b"Form"[..])));
+    assert_eq!(signed.int(b"Ff").unwrap_or(0) & 1, 1, "a signed box is not signed again");
+    assert!(!unsigned.contains(b"V") && !unsigned.contains(b"AP"));
+}
+
+#[test]
+fn a_carriage_return_and_line_feed_are_one_line_break() {
+    let lines = |t: &str| crate::text::plain(t).paragraphs.len();
+    assert_eq!(lines("one\r\ntwo\r\nthree"), 3);
+    assert_eq!(lines("one\ntwo\rthree"), 3);
+    assert_eq!(lines("one\r\n\r\ntwo"), 3, "an empty line stays");
+    // As the data holds it: character references, which the XML parser leaves alone.
+    let form = layout_xml(&wrapped_form("<form><body><notes>one&#xD;&#xA;two&#xD;&#xA;three</notes></body></form>")).unwrap();
+    let crlf = form.pages.iter().flat_map(widgets).find(|w| w.name == "notes").unwrap().rect.h;
+    let form = layout_xml(&wrapped_form("<form><body><notes>one&#xA;two&#xA;three</notes></body></form>")).unwrap();
+    let lf = form.pages.iter().flat_map(widgets).find(|w| w.name == "notes").unwrap().rect.h;
+    assert!((crlf - lf).abs() < 0.01);
 }

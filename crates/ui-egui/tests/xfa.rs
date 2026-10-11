@@ -36,6 +36,7 @@ const XFA_PACKET: &str = "<< /Length 52 >>\nstream\n<xdp:xdp xmlns:xdp=\"http://
 fn open(bytes: Vec<u8>) -> Harness<'static, PdfCraftApp> {
     let mut h = Harness::builder().with_size(egui::vec2(1400.0, 800.0)).build_eframe(move |_cc| {
         let mut app = PdfCraftApp::new();
+        app.set_option("language", "en").unwrap();
         app.open_bytes("form.pdf", None, bytes).expect("opens");
         app
     });
@@ -134,10 +135,10 @@ fn xfa_buttons_run_their_scripts_in_the_app() {
     };
     assert!(!names(&h).iter().any(|n| n == "amount_2"));
     click_field(&mut h, "addRow");
-    assert!(names(&h).iter().any(|n| n == "amount_2"), "{:?}", names(&h));
+    assert!(names(&h).iter().any(|n| n == "amount_2"), "{:?}; script console: {:?}", names(&h), h.state().js_console.log);
     // The message box shows as a notice.
     click_field(&mut h, "hello");
-    h.get_by_label_contains("Hello 2");
+    assert!(h.query_by_label_contains("Hello 2").is_some(), "script console: {:?}", h.state().js_console.log);
 }
 
 #[test]
@@ -146,7 +147,7 @@ fn messages_from_scripts_run_on_open_show_right_away() {
         .replace("if (qty.rawValue === null) qty.rawValue = 2;", r#"xfa.host.messageBox("Welcome to the form"); xfa.host.print();"#);
     let mut h = open(pdfcraft_xfa::fixtures::shell(&tpl));
     h.run_steps(2);
-    h.get_by_label_contains("Welcome to the form");
+    assert!(h.query_by_label_contains("Welcome to the form").is_some(), "script console: {:?}", h.state().js_console.log);
     assert_eq!(h.state().dialog, None, "an initialize script can't open the Print dialog");
     let id = h.state().views[0].id;
     assert!(h.state_mut().session.take_js_output(id).is_empty(), "nothing waits for the next edit");

@@ -8,6 +8,9 @@ use pdfcraft_engine::{Background, Edit, HeaderFooter, MarkKind, Watermark};
 use crate::theme::{self, Tokens};
 use crate::{PdfCraftApp, widgets};
 
+/// How far a watermark may be moved from the page centre, in points.
+const MAX_OFFSET: f64 = 20_000.0;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Subset {
     All,
@@ -269,6 +272,13 @@ pub(crate) fn body(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens, kind: M
                         ui.radio_value(&mut d.wm.behind, true, tl!("Appear behind page"));
                         ui.radio_value(&mut d.wm.behind, false, tl!("Appear on top of page"));
                     });
+                    ui.horizontal(|ui| {
+                        ui.label(tl!("Offset from centre"));
+                        ui.label(tl!("Horizontal"));
+                        ui.add(egui::DragValue::new(&mut d.wm.offset[0]).range(-MAX_OFFSET..=MAX_OFFSET).suffix(" pt"));
+                        ui.label(tl!("Vertical"));
+                        ui.add(egui::DragValue::new(&mut d.wm.offset[1]).range(-MAX_OFFSET..=MAX_OFFSET).suffix(" pt"));
+                    });
                 });
             });
         }
@@ -318,19 +328,14 @@ pub(crate) fn body(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens, kind: M
             }
             MarkKind::Watermark if file_name.is_some() => {
                 let side = r.width().min(r.height()) * wm.scale as f32;
+                let centre = r.center() + vec2(wm.offset[0] as f32 * s, -wm.offset[1] as f32 * s);
                 p.rect_stroke(
-                    Rect::from_center_size(r.center(), vec2(side, side)),
+                    Rect::from_center_size(centre, vec2(side, side)),
                     CornerRadius::ZERO,
                     egui::Stroke::new(1.0, Color32::GRAY),
                     egui::StrokeKind::Inside,
                 );
-                p.text(
-                    r.center(),
-                    egui::Align2::CENTER_CENTER,
-                    file_name.clone().unwrap_or_default(),
-                    egui::FontId::proportional(10.0),
-                    Color32::GRAY,
-                );
+                p.text(centre, egui::Align2::CENTER_CENTER, file_name.clone().unwrap_or_default(), egui::FontId::proportional(10.0), Color32::GRAY);
             }
             MarkKind::Watermark => {
                 let text = if wm.text.trim().is_empty() { "CONFIDENTIAL" } else { wm.text.trim() };
@@ -344,7 +349,8 @@ pub(crate) fn body(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens, kind: M
                 let half = galley.size() / 2.0;
                 let (sn, cs) = angle.sin_cos();
                 let offset = vec2(half.x * cs - half.y * sn, half.x * sn + half.y * cs);
-                p.add(egui::epaint::TextShape::new(r.center() - offset, galley, Color32::BLACK).with_angle(angle));
+                let centre = r.center() + vec2(wm.offset[0] as f32 * s, -wm.offset[1] as f32 * s);
+                p.add(egui::epaint::TextShape::new(centre - offset, galley, Color32::BLACK).with_angle(angle));
             }
             MarkKind::Background if file_name.is_some() => {
                 p.rect_stroke(r.shrink(6.0), CornerRadius::ZERO, egui::Stroke::new(1.0, Color32::GRAY), egui::StrokeKind::Inside);
@@ -480,5 +486,16 @@ mod tests {
         assert_eq!(r.pages(6), [1, 3, 5]);
         let r = PageRange { all: true, subset: Subset::Odd, ..PageRange::default() };
         assert_eq!(r.pages(5), [0, 2, 4]);
+    }
+
+    #[test]
+    fn the_watermark_edit_carries_the_offset() {
+        let mut d = MarksDraft::default();
+        d.wm.text = "DRAFT".into();
+        d.wm.offset = [-72.0, 36.0];
+        match edit(&d, MarkKind::Watermark, 3) {
+            Edit::AddWatermark { settings, .. } => assert_eq!(settings.offset, [-72.0, 36.0]),
+            other => panic!("expected AddWatermark, got {other:?}"),
+        }
     }
 }

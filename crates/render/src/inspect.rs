@@ -1,10 +1,11 @@
 //! Document inspection: everything panels need that is not pixels.
 //!
 //! Page geometry comes from hayro (which resolves inheritance and rotation); the rest comes from
-//! lopdf (bootstrap, replaced by `pdfcraft-model` in M2). Inspection is *tolerant*: when lopdf
-//! cannot load a file that hayro can render, panels are simply empty and `warnings` says why.
+//! the lazy COS reader through a read-only lopdf object adapter. The original lopdf loader
+//! remains the compatibility fallback. When neither can inspect a renderable file, panels
+//! are empty and `warnings` says why.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -13,8 +14,10 @@ use hayro::hayro_syntax::DecryptionError;
 use hayro::hayro_syntax::LoadPdfError;
 use hayro::hayro_syntax::Pdf;
 use lopdf::{Dictionary, Document, LoadOptions, Object, ObjectId};
+use pdfcraft_cos::page_labels::{MAX_LABEL_BYTES, MAX_LABEL_TOTAL_BYTES, MAX_LABEL_TREE_DEPTH, MAX_LABEL_TREE_WORK, MAX_PREFIX_BYTES, alpha, roman};
 
 use crate::OpenError;
+use crate::structure::{LazyStructure, Structure};
 
 /// lopdf decodes object and cross-reference streams while it loads, with no limit unless one is
 /// set: a few hundred bytes of nested FlateDecode then inflate to gigabytes. Real object and
@@ -27,18 +30,12 @@ const MAX_LAYER_STATE: usize = 1024;
 /// At most this many layers are read from all of `/RBGroups` together.
 const MAX_LAYER_GROUP_ENTRIES: usize = 4096;
 
-// Page labels (`/PageLabels`): every size they depend on comes from the file, so each is
-// bounded. The limits are storytold/pdfcraft#480's.
+/// `DocInfo::outline` holds the first this many bookmarks in outline order. Opening a document
+/// reads only this window; the rest are listed by page through `pdfcraft_organize`.
+const OUTLINE_WINDOW: usize = 10_000;
 
-/// A label, prefix included, of at most this many UTF-8 bytes; a longer one isn't made, and its
-/// page keeps its physical number. A hostile `/St` asked for a label of 3.5 × 10^17 letters.
-const MAX_LABEL_BYTES: usize = 1024;
-/// A raw `/P` is checked before it is decoded: room for a whole UTF-16BE label.
-const MAX_PREFIX_BYTES: usize = 2 * MAX_LABEL_BYTES + 2;
-/// All of a document's labels together, and all its decoded prefixes together.
-const MAX_LABEL_TOTAL_BYTES: usize = 4 << 20;
-/// Number-tree entries (nodes, kids and ranges) read from `/PageLabels` in all.
-const MAX_LABEL_TREE_WORK: usize = 200_000;
+/// Deepest level `DocInfo::outline` nests (the top level is 0); deeper bookmarks are left out.
+const OUTLINE_DEPTH: usize = 32;
 
 fn load_options(password: Option<&str>) -> LoadOptions {
     LoadOptions { password: password.map(str::to_owned), max_decompressed_size: Some(LOAD_STREAM_LIMIT), ..LoadOptions::default() }
@@ -61,6 +58,8 @@ pub struct DocInfo {
     pub xfa: Option<Xfa>,
     pub pages: Vec<PageInfo>,
     pub outline: Vec<OutlineItem>,
+    /// The outline has bookmarks that `outline` leaves out (see `OUTLINE_WINDOW`, `OUTLINE_DEPTH`).
+    pub outline_more: bool,
     pub annotations: Vec<Annotation>,
     pub fields: Vec<Field>,
     pub links: Vec<Link>,
@@ -125,6 +124,27 @@ impl PageInfo {
         [a * self.width, b * self.height]
     }
 
+    /// A destination's user-space point (each coordinate possibly unspecified) → the same point
+    /// as a fraction of the displayed page `[x, y]` (0..1 from its top-left corner, y down),
+    /// after `/Rotate` and a further clockwise `view_rotation` (0, 90, 180 or 270). On a page
+    /// turned a quarter, the user `x` decides the displayed `y` and vice versa, so each output
+    /// is `None` when the input it comes from is (or is not finite). Points off the page are
+    /// clamped to its edge.
+    pub fn dest_fraction(&self, x: Option<f32>, y: Option<f32>, view_rotation: u16) -> [Option<f32>; 2] {
+        let [cx0, cy0, cx1, cy1] = self.crop;
+        let frac = |v: f32| if v.is_finite() { Some(v.clamp(0.0, 1.0)) } else { None };
+        // Unrotated fractions across (u, from the crop's left) and down (v, from its top).
+        let u = x.and_then(|x| frac((x - cx0) / (cx1 - cx0).max(1e-3)));
+        let v = y.and_then(|y| frac((cy1 - y) / (cy1 - cy0).max(1e-3)));
+        let flip = |f: Option<f32>| f.map(|f| 1.0 - f);
+        match (u32::from(self.rotation) + u32::from(view_rotation)) % 360 {
+            90 => [flip(v), u],
+            180 => [flip(u), flip(v)],
+            270 => [v, flip(u)],
+            _ => [u, v],
+        }
+    }
+
     /// A view-space rectangle → the normalized user-space rectangle covering the same area of the
     /// page (`[x0, y0, x1, y1]`, `x0 <= x1`, `y0 <= y1`). Under `/Rotate` the corners swap roles,
     /// so a view rectangle's top-left is not in general the user rectangle's `[x0, y1]`.
@@ -156,7 +176,8 @@ pub struct Link {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum LinkTarget {
-    Page(usize),
+    /// A destination in this document: the 0-based page and where on it the view goes.
+    Page(usize, DestView),
     Uri(String),
     /// A set-layer-visibility action (`SetOCGState`, ISO 32000-2 §12.6.4.13): each change in
     /// order, naming the layer by its optional content group. With `preserve_rb`, a layer turned
@@ -176,10 +197,55 @@ pub enum LayerOp {
     Toggle,
 }
 
+/// Where an explicit destination (ISO 32000-2 §12.3.2.2, Table 149) places its page in the
+/// window. Coordinates are PDF user space; `None` is a `null` (or unusable) operand, which keeps
+/// that part of the view as it is.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum DestView {
+    /// The top of the page at the current zoom: a destination with no position, or one whose
+    /// type is missing or unknown.
+    #[default]
+    Top,
+    /// `/XYZ left top zoom`: the point (left, top) at the window's upper-left corner, at `zoom`
+    /// (1.0 = 100%; 0 or null keeps the current zoom).
+    Xyz { left: Option<f32>, top: Option<f32>, zoom: Option<f32> },
+    /// `/Fit`, and `/FitB` (fit the page's content box; read as the whole page).
+    Fit,
+    /// `/FitH top`, and `/FitBH`: fit the width, with `top` at the window's top edge.
+    FitH { top: Option<f32> },
+    /// `/FitV left`, and `/FitBV`: fit the height, with `left` at the window's left edge.
+    FitV { left: Option<f32> },
+    /// `/FitR left bottom right top`: fit the rectangle `[x0, y0, x1, y1]` (normalized).
+    FitR { rect: [f32; 4] },
+}
+
+impl DestView {
+    /// The view an explicit destination array asks for, from its elements after the page
+    /// (`/XYZ left top zoom`, `/FitH top`, …). Hostile input never fails: a missing or unknown
+    /// type, or a `/FitR` without four usable numbers, is [`DestView::Top`]; a non-numeric,
+    /// non-finite or missing operand is `None`; a zoom that is not positive is `None`.
+    pub fn from_operands(kind: Option<&[u8]>, operands: &[Option<f32>]) -> Self {
+        let n = |i: usize| operands.get(i).copied().flatten().filter(|v| v.is_finite());
+        match kind {
+            Some(b"XYZ") => Self::Xyz { left: n(0), top: n(1), zoom: n(2).filter(|z| *z > 0.0) },
+            Some(b"Fit" | b"FitB") => Self::Fit,
+            Some(b"FitH" | b"FitBH") => Self::FitH { top: n(0) },
+            Some(b"FitV" | b"FitBV") => Self::FitV { left: n(0) },
+            Some(b"FitR") => match (n(0), n(1), n(2), n(3)) {
+                (Some(x0), Some(y0), Some(x1), Some(y1)) => Self::FitR { rect: [x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1)] },
+                _ => Self::Top,
+            },
+            _ => Self::Top,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct OutlineItem {
     pub title: String,
     pub page: Option<usize>,
+    /// Where on `page` the bookmark goes ([`DestView::Top`] for a bookmark without a page).
+    pub view: DestView,
     pub children: Vec<OutlineItem>,
     pub open: bool,
 }
@@ -207,6 +273,9 @@ pub struct Annotation {
     pub locked: bool,
     /// `/IT`, the intent: `FreeTextCallout`, `PolygonCloud`, `FreeTextTypeWriter`…
     pub intent: Option<String>,
+    /// A Fill & Sign mark: typed text, a check, cross, dot or line, or a typed, drawn or picture
+    /// signature or initials (the rules of `pdfcraft_annot::is_fill_sign`).
+    pub fill_sign: bool,
 }
 
 impl Annotation {
@@ -317,7 +386,28 @@ pub fn inspect(bytes: Arc<Vec<u8>>, password: Option<&str>) -> Result<DocInfo, O
         Err(p) => return Err(OpenError::Invalid(format!("the page tree could not be read: {}", crate::raster::panic_message(&p)))),
     }
     let options = load_options(password);
+    // Geometry no longer needs the renderer parser. Do not overlap its allocations with
+    // structural inspection, including the compatibility fallback for damaged files.
+    drop(pdf);
     inspect_structure(&mut info, |tmp| {
+        // The lazy reader first; lopdf's repair/tolerance path when it can't expose the same
+        // page tree or an object a panel needs. No partial result is published.
+        let lazy = catch_unwind(AssertUnwindSafe(|| {
+            let doc = LazyStructure::new(bytes.clone(), password).ok()?;
+            let mut t = DocInfo { pages: tmp.pages.clone(), ..Default::default() };
+            let inspector = Inspector::new(&doc);
+            if inspector.page_index.len() != t.pages.len() {
+                return None;
+            }
+            inspector.fill(&mut t);
+            (!doc.failed()).then_some(t)
+        }))
+        .ok()
+        .flatten();
+        if let Some(t) = lazy {
+            *tmp = t;
+            return Ok(());
+        }
         let doc = Document::load_mem_with_options(&bytes, options).map_err(|e| e.to_string())?;
         Inspector::new(&doc).fill(tmp);
         Ok(())
@@ -349,7 +439,7 @@ fn inspect_structure(info: &mut DocInfo, fill: impl FnOnce(&mut DocInfo) -> Resu
 }
 
 struct Inspector<'a> {
-    doc: &'a Document,
+    doc: &'a dyn Structure,
     page_index: HashMap<ObjectId, usize>,
     /// Named destinations (`/Names /Dests` tree), keyed by raw string bytes, built once.
     /// Looking each name up by walking the tree was O(links × names): minutes on manuals.
@@ -357,7 +447,7 @@ struct Inspector<'a> {
 }
 
 impl<'a> Inspector<'a> {
-    fn new(doc: &'a Document) -> Self {
+    fn new(doc: &'a dyn Structure) -> Self {
         let page_index = doc.get_pages().into_iter().map(|(n, id)| (id, n as usize - 1)).collect();
         let mut me = Self { doc, page_index, named: HashMap::new() };
         let mut named = HashMap::new();
@@ -372,8 +462,8 @@ impl<'a> Inspector<'a> {
 
     fn fill(&self, info: &mut DocInfo) {
         // lopdf drops /Encrypt from the trailer once it has decrypted the file.
-        info.encrypted = self.doc.is_encrypted() || self.doc.was_encrypted() || self.doc.trailer.get(b"Encrypt").is_ok();
-        if let Some(d) = self.doc.trailer.get(b"Info").ok().and_then(|o| self.dict(o)) {
+        info.encrypted = self.doc.encrypted();
+        if let Some(d) = self.doc.trailer().get(b"Info").ok().and_then(|o| self.dict(o)) {
             info.title = self.text(d, b"Title");
             info.author = self.text(d, b"Author");
             info.subject = self.text(d, b"Subject");
@@ -394,16 +484,36 @@ impl<'a> Inspector<'a> {
             Err(reason) => info.warnings.push(format!("Page labels were skipped: {reason}; using physical page numbers.")),
         }
         if let Some(first) = catalog.get(b"Outlines").ok().and_then(|o| self.dict(o)).and_then(|d| d.get(b"First").ok()) {
-            let mut seen = HashSet::new();
-            info.outline = self.outline_siblings(first, &mut seen, 0);
+            (info.outline, info.outline_more) = self.outline_window(first);
         }
         self.annotations(info);
+        let mut field_seen = HashSet::new();
         if let Some(form) = catalog.get(b"AcroForm").ok().and_then(|o| self.dict(o))
             && let Ok(fields) = form.get(b"Fields").and_then(|o| self.resolve(o).as_array())
         {
-            let mut seen = HashSet::new();
             for f in fields {
-                self.field(f, None, &mut info.fields, &mut seen, 0);
+                self.field(f, None, &mut info.fields, &mut field_seen, 0);
+            }
+        }
+        // Widgets no `/Fields` entry reaches are fields too (Acrobat and the browsers fill them);
+        // each is adopted through its topmost unlisted `/Parent`, so a split field stays one.
+        let mut pages: Vec<_> = self.page_index.iter().collect();
+        pages.sort_by_key(|(_, i)| **i);
+        for (&pid, _) in pages {
+            let Ok(page_dict) = self.doc.get_dictionary(pid) else { continue };
+            let Ok(Object::Array(annots)) = page_dict.get(b"Annots").map(|o| self.resolve(o)) else { continue };
+            for a in annots {
+                let Some(d) = self.dict(a) else { continue };
+                if self.name(d, b"Subtype").as_deref() != Some("Widget")
+                    || (d.get(b"FT").is_err() && d.get(b"T").is_err() && d.get(b"Parent").is_err())
+                {
+                    continue;
+                }
+                if let Object::Reference(id) = a
+                    && let Some(root) = self.unlisted_field(*id, &field_seen)
+                {
+                    self.field(&Object::Reference(root), None, &mut info.fields, &mut field_seen, 0);
+                }
             }
         }
         info.has_javascript |= info.fields.iter().any(|f| f.has_actions);
@@ -442,7 +552,7 @@ impl<'a> Inspector<'a> {
     fn text(&self, d: &Dictionary, key: &[u8]) -> Option<String> {
         let o = self.resolve(d.get(key).ok()?);
         let s = match o {
-            Object::String(..) => lopdf::decode_text_string(o).ok()?,
+            Object::String(bytes, _) => text_string(bytes),
             Object::Name(n) => String::from_utf8_lossy(n).into_owned(),
             _ => return None,
         };
@@ -452,6 +562,25 @@ impl<'a> Inspector<'a> {
 
     fn name(&self, d: &Dictionary, key: &[u8]) -> Option<String> {
         self.resolve(d.get(key).ok()?).as_name().ok().map(|n| String::from_utf8_lossy(n).into_owned())
+    }
+
+    /// Whether an annotation is a Fill & Sign mark. Keep in step with
+    /// `pdfcraft_annot::is_fill_sign`, which the engine's comment list uses.
+    fn is_fill_sign(&self, d: &Dictionary, subtype: &str) -> bool {
+        let yes = |key: &[u8]| matches!(d.get(key).map(|o| self.resolve(o)), Ok(Object::Boolean(true)));
+        if yes(b"PCFillSign") {
+            return true;
+        }
+        match subtype {
+            "FreeText" => self.name(d, b"IT").as_deref() == Some("FreeTextTypeWriter"),
+            "Stamp" => match self.name(d, b"Name").as_deref() {
+                Some("PCCheck" | "PCCross" | "PCDot" | "PCLine" | "PCTypedSignature") => true,
+                Some("PCCustomSignature" | "PCCustomInitials") => yes(b"PCPictureImage"),
+                _ => false,
+            },
+            "Ink" => self.text(d, b"Subj").as_deref() == Some("Signature"),
+            _ => false,
+        }
     }
 
     fn page_of(&self, o: &Object) -> Option<usize> {
@@ -465,14 +594,21 @@ impl<'a> Inspector<'a> {
 
     // ── destinations ────────────────────────────────────────────────────────────────────────
 
-    fn dest_page(&self, dest: &Object, depth: u32) -> Option<usize> {
+    /// The page and view of a destination: an explicit array (`[page /XYZ left top zoom]`, …),
+    /// a dictionary with `/D`, or a named destination that resolves to one.
+    fn dest(&self, dest: &Object, depth: u32) -> Option<(usize, DestView)> {
         if depth > 8 {
             return None;
         }
         match self.resolve(dest) {
-            Object::Array(a) => a.first().and_then(|p| self.page_of(p)),
-            Object::Dictionary(d) => d.get(b"D").ok().and_then(|d| self.dest_page(d, depth + 1)),
-            Object::String(key, _) | Object::Name(key) => self.named_dest(key).and_then(|d| self.dest_page(d, depth + 1)),
+            Object::Array(a) => {
+                let page = a.first().and_then(|p| self.page_of(p))?;
+                let kind = a.get(1).map(|k| self.resolve(k)).and_then(|k| k.as_name().ok());
+                let operands: Vec<Option<f32>> = a.iter().skip(2).take(4).map(|o| self.resolve(o).as_float().ok()).collect();
+                Some((page, DestView::from_operands(kind, &operands)))
+            }
+            Object::Dictionary(d) => d.get(b"D").ok().and_then(|d| self.dest(d, depth + 1)),
+            Object::String(key, _) | Object::Name(key) => self.named_dest(key).and_then(|d| self.dest(d, depth + 1)),
             _ => None,
         }
     }
@@ -520,7 +656,10 @@ impl<'a> Inspector<'a> {
         if let Ok(Object::Array(pairs)) = node.get(b"Names").map(|o| self.resolve(o)) {
             for pair in pairs.chunks(2) {
                 if let [k, v] = pair {
-                    let key = lopdf::decode_text_string(self.resolve(k)).unwrap_or_default();
+                    let key = match self.resolve(k) {
+                        Object::String(bytes, _) => text_string(bytes),
+                        _ => String::new(),
+                    };
                     out.push((key, v));
                 }
             }
@@ -537,139 +676,180 @@ impl<'a> Inspector<'a> {
 
     // ── outline ─────────────────────────────────────────────────────────────────────────────
 
-    fn outline_siblings(&self, first: &'a Object, seen: &mut HashSet<ObjectId>, depth: u32) -> Vec<OutlineItem> {
-        let mut items = Vec::new();
-        let mut cur = Some(first);
-        while let Some(o) = cur {
+    /// The window `DocInfo::outline` keeps: the first `OUTLINE_WINDOW` bookmarks in outline order,
+    /// nested no deeper than `OUTLINE_DEPTH`, and whether any bookmark was left out. Iterative, and
+    /// each bookmark is read once, so the work and memory stay within the window.
+    fn outline_window(&self, first: &'a Object) -> (Vec<OutlineItem>, bool) {
+        let mut seen = HashSet::new();
+        // The listed bookmarks in outline order, with their depth.
+        let mut listed: Vec<(usize, OutlineItem)> = Vec::new();
+        // One entry per open level: its next sibling, or `None` once that run of siblings has ended.
+        let mut levels: Vec<Option<&'a Object>> = vec![Some(first)];
+        let mut more = false;
+        while let Some(depth) = levels.len().checked_sub(1) {
+            let Some(slot) = levels.get_mut(depth) else { break };
+            let Some(o) = slot.take() else {
+                levels.pop();
+                continue;
+            };
             if let Object::Reference(id) = o
                 && !seen.insert(*id)
             {
-                break; // cycle
+                continue; // cycle: this run of siblings ends here
             }
-            let Some(d) = self.dict(o) else { break };
-            let page = d
-                .get(b"Dest")
-                .ok()
-                .and_then(|dest| self.dest_page(dest, 0))
-                .or_else(|| d.get(b"A").ok().and_then(|a| self.dict(a)).and_then(|a| a.get(b"D").ok()).and_then(|dest| self.dest_page(dest, 0)));
-            let children = match (d.get(b"First").ok(), depth < 32) {
-                (Some(f), true) => self.outline_siblings(f, seen, depth + 1),
-                _ => Vec::new(),
-            };
-            let open = d.get(b"Count").ok().and_then(|c| c.as_i64().ok()).is_some_and(|c| c > 0);
-            items.push(OutlineItem { title: self.text(d, b"Title").unwrap_or_default(), page, children, open });
-            cur = d.get(b"Next").ok();
-            if items.len() > 100_000 {
+            let Some(d) = self.dict(o) else { continue };
+            if listed.len() >= OUTLINE_WINDOW {
+                more = true;
                 break;
             }
+            *slot = d.get(b"Next").ok();
+            let dest = d
+                .get(b"Dest")
+                .ok()
+                .and_then(|dest| self.dest(dest, 0))
+                .or_else(|| d.get(b"A").ok().and_then(|a| self.dict(a)).and_then(|a| a.get(b"D").ok()).and_then(|dest| self.dest(dest, 0)));
+            let (page, view) = dest.map_or((None, DestView::Top), |(p, v)| (Some(p), v));
+            match d.get(b"First").ok() {
+                Some(child) if depth < OUTLINE_DEPTH => levels.push(Some(child)),
+                Some(_) => more = true,
+                None => {}
+            }
+            let open = d.get(b"Count").ok().and_then(|c| c.as_i64().ok()).is_some_and(|c| c > 0);
+            let title = self.text(d, b"Title").unwrap_or_default();
+            listed.push((depth, OutlineItem { title, page, view, children: Vec::new(), open }));
         }
-        items
+        (nest_outline(listed), more)
     }
 
     // ── page labels (ISO 32000-2 §12.4.2) ───────────────────────────────────────────────────
 
-    /// Apply `/PageLabels` to `pages`, within the limits above: the number tree is read once per
-    /// node and at most [`MAX_LABEL_TREE_WORK`] entries in all; a range's prefix is checked
-    /// before it is decoded, and decoded once; a label over [`MAX_LABEL_BYTES`] isn't made (its
-    /// page keeps its physical number), and labels over [`MAX_LABEL_TOTAL_BYTES`] in all are not
-    /// applied at all. `Err`: no label is applied, and why. `Ok`: what was left out.
+    fn label_object(&self, object: &'a Object) -> Result<&'a Object, &'static str> {
+        self.doc.dereference(object).map(|(_, o)| o).map_err(|_| "a number tree reference is missing or cyclic")
+    }
+
+    fn label_dict(&self, object: &'a Object) -> Result<Option<&'a Dictionary>, &'static str> {
+        Ok(match self.label_object(object)? {
+            Object::Dictionary(d) => Some(d),
+            Object::Stream(s) => Some(&s.dict),
+            _ => None,
+        })
+    }
+
+    /// Apply `/PageLabels` to `pages`. `Err`: the tree is unusable and no label is applied.
+    /// `Ok(notes)`: labels applied, with what was repaired on the way (a duplicated start page,
+    /// a range whose labels are too long to show).
     fn page_labels(&self, catalog: &Dictionary, pages: &mut [PageInfo]) -> Result<Vec<String>, &'static str> {
         let mut notes = Vec::new();
-        let Some(tree) = catalog.get(b"PageLabels").ok().and_then(|o| self.dict(o)) else { return Ok(notes) };
+        let Ok(tree) = catalog.get(b"PageLabels") else { return Ok(notes) };
+        let Some(tree) = self.label_dict(tree)? else { return Ok(notes) };
         let mut ranges: BTreeMap<usize, &Dictionary> = BTreeMap::new();
-        let mut stack = vec![(tree, 0u32)];
+        let mut stack = vec![(tree, 0usize)];
         let mut seen = HashSet::new();
-        let mut work = 0usize;
+        let mut left = MAX_LABEL_TREE_WORK;
         while let Some((node, depth)) = stack.pop() {
-            // A node named twice, or a cycle, is read once.
+            label_work(&mut left, 1)?;
+            if depth > MAX_LABEL_TREE_DEPTH {
+                return Err("the number tree is too deep");
+            }
             if !seen.insert(node as *const Dictionary) {
-                continue;
+                return Err("the number tree repeats a node or contains a cycle");
             }
-            let nums = match node.get(b"Nums").map(|o| self.resolve(o)) {
-                Ok(Object::Array(nums)) => nums.as_slice(),
-                _ => &[],
-            };
-            let kids = match node.get(b"Kids").map(|o| self.resolve(o)) {
-                Ok(Object::Array(kids)) if depth < 32 => kids.as_slice(),
-                _ => &[],
-            };
-            work = work.saturating_add(1).saturating_add(nums.len().div_ceil(2)).saturating_add(kids.len());
-            if work > MAX_LABEL_TREE_WORK {
-                return Err("the number tree is too large");
-            }
-            for pair in nums.chunks(2) {
-                if let [k, v] = pair
-                    && let (Ok(start), Some(d)) = (self.resolve(k).as_i64(), self.dict(v))
-                    && let Ok(start) = usize::try_from(start)
-                {
-                    ranges.insert(start, d);
+            if let Ok(nums) = node.get(b"Nums")
+                && let Object::Array(nums) = self.label_object(nums)?
+            {
+                label_work(&mut left, nums.len().div_ceil(2))?;
+                for pair in nums.chunks(2) {
+                    if let [k, v] = pair
+                        && let (Ok(start), Some(d)) = (self.label_object(k)?.as_i64(), self.label_dict(v)?)
+                        && let Ok(start) = usize::try_from(start)
+                        && ranges.insert(start, d).is_some()
+                    {
+                        // The later range wins, as in readers that overwrite.
+                        notes.push(format!("a range starts on page {} twice; the later one is used", start.saturating_add(1)));
+                    }
                 }
             }
-            stack.extend(kids.iter().filter_map(|k| self.dict(k)).map(|d| (d, depth + 1)));
+            if let Ok(kids) = node.get(b"Kids")
+                && let Object::Array(kids) = self.label_object(kids)?
+            {
+                label_work(&mut left, kids.len())?;
+                if kids.len() > MAX_LABEL_TREE_WORK.saturating_sub(stack.len()) {
+                    return Err("the number tree has too many pending nodes");
+                }
+                if !kids.is_empty() && depth == MAX_LABEL_TREE_DEPTH {
+                    return Err("the number tree is too deep");
+                }
+                for kid in kids {
+                    if let Some(d) = self.label_dict(kid)? {
+                        stack.push((d, depth + 1));
+                    }
+                }
+            }
         }
-        // Each range that starts on a page, once: (first number, prefix, style). A prefix too long
-        // to show is `None`, and so are the labels of its range.
+        // Decode each bounded prefix once, rather than once for every page in its range.
         let mut specs = BTreeMap::new();
-        let mut prefixes = 0usize;
-        for (&start, d) in ranges.range(..pages.len()) {
-            let raw = match d.get(b"P").map(|o| self.resolve(o)) {
-                Ok(Object::String(raw, _) | Object::Name(raw)) => raw.len(),
-                _ => 0,
+        for (start, d) in ranges {
+            let first = d.get(b"St").ok().and_then(|o| self.resolve(o).as_i64().ok()).unwrap_or(1).max(1) as u64;
+            let prefix = match d.get(b"P").ok().map(|o| self.resolve(o)) {
+                Some(Object::String(raw, _) | Object::Name(raw)) => {
+                    if raw.len() > MAX_PREFIX_BYTES {
+                        return Err("a raw prefix exceeds 2050 bytes");
+                    }
+                    self.text(d, b"P").unwrap_or_default()
+                }
+                _ => String::new(),
             };
-            let prefix = (raw <= MAX_PREFIX_BYTES).then(|| self.text(d, b"P").unwrap_or_default()).filter(|p| p.len() <= MAX_LABEL_BYTES);
-            prefixes = prefixes.saturating_add(prefix.as_ref().map_or(0, String::len));
-            if prefixes > MAX_LABEL_TOTAL_BYTES {
-                return Err("the label prefixes take more than 4 MiB in all");
+            if prefix.len() > MAX_LABEL_BYTES {
+                return Err("a decoded prefix exceeds 1024 UTF-8 bytes");
             }
-            let first = d.get(b"St").ok().and_then(|o| self.resolve(o).as_i64().ok()).unwrap_or(1).max(1).unsigned_abs();
-            specs.insert(start, (first, prefix, self.name(d, b"S")));
+            let style = d.get(b"S").ok().and_then(|o| self.resolve(o).as_name().ok());
+            specs.insert(start, (first, prefix, style));
         }
-        let mut labels = Vec::new();
+        let mut staged = Vec::new();
         let mut total = 0usize;
-        let mut too_long = BTreeSet::new();
-        for i in 0..pages.len() {
+        for (i, _) in pages.iter().enumerate() {
             let Some((&start, (first, prefix, style))) = specs.range(..=i).next_back() else { continue };
-            let label = prefix.as_ref().and_then(|prefix| {
-                let left = MAX_LABEL_BYTES.saturating_sub(prefix.len());
-                // The page's number, checked: `/St` can be anything up to i64::MAX.
-                let n = || u64::try_from(i - start).ok().and_then(|offset| first.checked_add(offset));
-                let number = match style.as_deref() {
-                    Some("D") => n().map(|n| n.to_string()).filter(|s| s.len() <= left),
-                    Some("R") => n().and_then(|n| roman(n, left)).map(|s| s.to_ascii_uppercase()),
-                    Some("r") => n().and_then(|n| roman(n, left)),
-                    Some("A") => n().and_then(|n| alpha(n, left)).map(|s| s.to_ascii_uppercase()),
-                    Some("a") => n().and_then(|n| alpha(n, left)),
-                    _ => Some(String::new()),
-                }?;
-                Some(format!("{prefix}{number}"))
-            });
-            let Some(label) = label else {
-                too_long.insert(start);
+            let n = if matches!(*style, Some(b"D" | b"R" | b"r" | b"A" | b"a")) {
+                let offset = u64::try_from(i - start).map_err(|_| "a page number is too large")?;
+                first.checked_add(offset).ok_or("a page number overflows")?
+            } else {
+                0 // /St is unused when the label consists only of its prefix.
+            };
+            let remaining = MAX_LABEL_BYTES - prefix.len();
+            let number = match *style {
+                Some(b"D") => Some(n.to_string()),
+                Some(b"R" | b"r") => roman(n, remaining),
+                Some(b"A" | b"a") => alpha(n, remaining),
+                _ => Some(String::new()),
+            }
+            .filter(|number| number.len() <= remaining);
+            // A label too long to show keeps that page's physical number; other ranges stay.
+            let Some(mut number) = number else {
+                let note = format!(
+                    "labels from page {} exceed {MAX_LABEL_BYTES} UTF-8 bytes; those pages show their physical page numbers",
+                    start.saturating_add(1)
+                );
+                if !notes.contains(&note) {
+                    notes.push(note);
+                }
                 continue;
             };
-            // An empty label (no prefix, no style) keeps the physical number.
+            if matches!(*style, Some(b"R" | b"A")) {
+                number.make_ascii_uppercase();
+            }
+            let mut label = prefix.clone();
+            label.push_str(&number);
             if label.is_empty() {
-                continue;
+                continue; // Keep the existing physical number for an empty custom label.
             }
-            total = total.saturating_add(label.len());
+            total = total.checked_add(label.len()).ok_or("the total label size overflows")?;
             if total > MAX_LABEL_TOTAL_BYTES {
-                return Err("the labels take more than 4 MiB in all");
+                return Err("custom labels exceed 4 MiB in total");
             }
-            labels.push((i, label));
+            staged.push((i, label));
         }
-        if let Some(&first) = too_long.first() {
-            let others = match too_long.len().saturating_sub(1) {
-                0 => String::new(),
-                1 => " and 1 other range".into(),
-                n => format!(" and {n} other ranges"),
-            };
-            notes.push(format!(
-                "the labels from page {}{others} are longer than {MAX_LABEL_BYTES} bytes, so those pages show their physical numbers",
-                first.saturating_add(1)
-            ));
-        }
-        // Applied only once all of them are known to fit: never a half-labelled document.
-        for (i, label) in labels {
+        // A malformed later range must not leave a partially applied custom label sequence.
+        for (i, label) in staged {
             if let Some(page) = pages.get_mut(i) {
                 page.label = label;
             }
@@ -701,7 +881,11 @@ impl<'a> Inspector<'a> {
                     }
                     continue;
                 }
-                if matches!(subtype.as_str(), "Widget" | "Popup") {
+                // Not comments: form widgets, pop-ups and non-markup annotations such as the
+                // Screen annotation that drives a LaTeX `animate` player (keep in step with
+                // `pdfcraft_annot::is_comment_subtype`).
+                if matches!(subtype.as_str(), "Widget" | "Popup" | "Screen" | "Movie" | "RichMedia" | "3D" | "PrinterMark" | "TrapNet" | "Watermark")
+                {
                     continue;
                 }
                 let rect = rect4(self.resolve(d.get(b"Rect").unwrap_or(&Object::Null)));
@@ -732,6 +916,7 @@ impl<'a> Inspector<'a> {
                     _ => Vec::new(),
                 };
                 let in_reply_to = d.get(b"IRT").ok().and_then(|o| self.dict(o)).and_then(|p| self.text(p, b"NM"));
+                let fill_sign = self.is_fill_sign(d, &subtype);
                 info.annotations.push(Annotation {
                     page,
                     subtype,
@@ -747,6 +932,7 @@ impl<'a> Inspector<'a> {
                     quads,
                     locked: d.get(b"F").ok().and_then(|f| self.resolve(f).as_i64().ok()).unwrap_or(0) & 128 != 0,
                     intent: self.name(d, b"IT"),
+                    fill_sign,
                 });
             }
         }
@@ -756,11 +942,15 @@ impl<'a> Inspector<'a> {
     fn link(&self, page: usize, d: &Dictionary) -> Option<Link> {
         let rect = rect4(self.resolve(d.get(b"Rect").ok()?));
         let target = if let Ok(dest) = d.get(b"Dest") {
-            LinkTarget::Page(self.dest_page(dest, 0)?)
+            let (page, view) = self.dest(dest, 0)?;
+            LinkTarget::Page(page, view)
         } else {
             let a = d.get(b"A").ok().and_then(|a| self.dict(a))?;
             match self.name(a, b"S").as_deref() {
-                Some("GoTo") => LinkTarget::Page(self.dest_page(a.get(b"D").ok()?, 0)?),
+                Some("GoTo") => {
+                    let (page, view) = self.dest(a.get(b"D").ok()?, 0)?;
+                    LinkTarget::Page(page, view)
+                }
                 Some("URI") => {
                     LinkTarget::Uri(a.get(b"URI").ok().and_then(|u| self.resolve(u).as_str().ok()).map(|b| String::from_utf8_lossy(b).into_owned())?)
                 }
@@ -850,8 +1040,16 @@ impl<'a> Inspector<'a> {
         };
         let value = match d.get(b"V").map(|v| self.resolve(v)) {
             Ok(Object::Name(n)) => Some(String::from_utf8_lossy(n).into_owned()),
-            Ok(v @ Object::String(..)) => lopdf::decode_text_string(v).ok(),
-            Ok(Object::Array(a)) => Some(a.iter().filter_map(|x| lopdf::decode_text_string(self.resolve(x)).ok()).collect::<Vec<_>>().join(", ")),
+            Ok(Object::String(bytes, _)) => Some(text_string(bytes)),
+            Ok(Object::Array(a)) => Some(
+                a.iter()
+                    .filter_map(|x| match self.resolve(x) {
+                        Object::String(bytes, _) => Some(text_string(bytes)),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
             Ok(Object::Dictionary(_)) if kind == FieldKind::Signature => Some("signed".into()),
             _ => None,
         };
@@ -874,6 +1072,31 @@ impl<'a> Inspector<'a> {
             let arr = self.resolve(annots).as_array().ok()?;
             arr.iter().any(|a| matches!(a, Object::Reference(id) if targets.contains(id))).then_some(idx)
         })
+    }
+
+    /// The topmost field above widget `id` (itself without a `/Parent`), or `None` when it or an
+    /// ancestor is already reachable from the `/Fields` tree, or a `/Parent` loop hides the top.
+    fn unlisted_field(&self, id: ObjectId, seen: &HashSet<ObjectId>) -> Option<ObjectId> {
+        let mut top = id;
+        let mut visited = HashSet::from([id]);
+        loop {
+            let o = Object::Reference(top);
+            let d = self.dict(&o)?;
+            let parent = match d.get(b"Parent") {
+                Ok(Object::Reference(p)) => Some(*p),
+                _ => None,
+            };
+            let Some(p) = parent else {
+                return if seen.contains(&top) { None } else { Some(top) };
+            };
+            if !visited.insert(p) || visited.len() > 64 {
+                return None;
+            }
+            if seen.contains(&p) {
+                return None;
+            }
+            top = p;
+        }
     }
 
     // ── optional content ────────────────────────────────────────────────────────────────────
@@ -997,6 +1220,39 @@ impl<'a> Inspector<'a> {
     }
 }
 
+/// A text string's value, decoded by the same rules as the engine's object model
+/// ([`pdfcraft_cos::PdfString::to_text`]) so the panels and outline editing agree.
+fn text_string(bytes: &[u8]) -> String {
+    pdfcraft_cos::PdfString::literal(bytes).to_text()
+}
+
+/// Nests a pre-order list of `(depth, item)` into the outline tree.
+fn nest_outline(listed: Vec<(usize, OutlineItem)>) -> Vec<OutlineItem> {
+    let mut roots = Vec::new();
+    // The open ancestors, outermost first; each collects its children until it closes.
+    let mut open: Vec<(usize, OutlineItem)> = Vec::new();
+    for (depth, item) in listed {
+        while open.last().is_some_and(|(d, _)| *d >= depth) {
+            close_outline(&mut open, &mut roots);
+        }
+        open.push((depth, item));
+    }
+    while !open.is_empty() {
+        close_outline(&mut open, &mut roots);
+    }
+    roots
+}
+
+/// Closes the innermost open bookmark: it joins its parent's children, or the top level.
+fn close_outline(open: &mut Vec<(usize, OutlineItem)>, roots: &mut Vec<OutlineItem>) {
+    if let Some((_, item)) = open.pop() {
+        match open.last_mut() {
+            Some((_, parent)) => parent.children.push(item),
+            None => roots.push(item),
+        }
+    }
+}
+
 fn rect4(o: &Object) -> [f32; 4] {
     match o {
         Object::Array(a) if a.len() == 4 => {
@@ -1007,50 +1263,9 @@ fn rect4(o: &Object) -> [f32; 4] {
     }
 }
 
-/// Lowercase Roman numerals for `n`, or `None` if they take more than `max_bytes` (at most
-/// [`MAX_LABEL_BYTES`]). Each length is checked before anything is repeated: `n` comes from the
-/// file, and its thousands alone can be quadrillions of `m`s.
-fn roman(mut n: u64, max_bytes: usize) -> Option<String> {
-    const T: [(u64, &str); 13] = [
-        (1000, "m"),
-        (900, "cm"),
-        (500, "d"),
-        (400, "cd"),
-        (100, "c"),
-        (90, "xc"),
-        (50, "l"),
-        (40, "xl"),
-        (10, "x"),
-        (9, "ix"),
-        (5, "v"),
-        (4, "iv"),
-        (1, "i"),
-    ];
-    let max_bytes = max_bytes.min(MAX_LABEL_BYTES);
-    let mut s = String::new();
-    for (v, r) in T {
-        let count = usize::try_from(n / v).ok()?;
-        if count.checked_mul(r.len())? > max_bytes.saturating_sub(s.len()) {
-            return None;
-        }
-        s.push_str(&r.repeat(count));
-        n %= v;
-    }
-    Some(s)
-}
-
-/// a..z, aa..zz, aaa.. (ISO 32000-2: "a to z for the first 26 pages, aa to zz for the next 26"),
-/// or `None` if that takes more than `max_bytes` (at most [`MAX_LABEL_BYTES`]), checked before
-/// the letter is repeated.
-fn alpha(n: u64, max_bytes: usize) -> Option<String> {
-    let n = n.max(1) - 1;
-    let count = usize::try_from(n / 26 + 1).ok()?;
-    if count > max_bytes.min(MAX_LABEL_BYTES) {
-        return None;
-    }
-    // n % 26 < 26: a lowercase ASCII letter.
-    let letter = char::from(b'a' + (n % 26) as u8);
-    Some(std::iter::repeat_n(letter, count).collect())
+fn label_work(left: &mut usize, count: usize) -> Result<(), &'static str> {
+    *left = left.checked_sub(count).ok_or("the number tree has too many entries")?;
+    Ok(())
 }
 
 /// `D:20260930104512-04'00'` → `2026-09-30 10:45`.
@@ -1111,6 +1326,263 @@ mod tests {
     }
 
     #[test]
+    fn empty_png_predictor_frames_do_not_allocate_rows() {
+        // usize::MAX cannot be reserved, so the old code safely errors before allocating.
+        // An empty frame needs no rows regardless of the declared width.
+        assert!(lopdf::filters::png::decode_frame(&[], 1, usize::MAX).unwrap().is_empty());
+    }
+
+    fn tiff_predictor_stream(data: Vec<u8>, columns: i64, colors: i64, bits: i64) -> lopdf::Stream {
+        let mut params = lopdf::Dictionary::new();
+        params.set("Predictor", 2i64);
+        params.set("Columns", columns);
+        params.set("Colors", colors);
+        params.set("BitsPerComponent", bits);
+        let mut dict = lopdf::Dictionary::new();
+        dict.set("DecodeParms", params);
+        let mut stream = lopdf::Stream::new(dict, data);
+        stream.compress().unwrap();
+        assert_eq!(stream.dict.get(b"Filter").unwrap().as_name().unwrap(), b"FlateDecode");
+        stream
+    }
+
+    #[test]
+    fn tiff_subbyte_predictor_row_width_overflow_is_refused() {
+        // Each multiplication overflows before any scratch allocation in the old debug build.
+        for bits in [1, 2, 4] {
+            let stream = tiff_predictor_stream(vec![0; 64], i64::MAX, 3, bits);
+            assert!(
+                matches!(stream.decompressed_content_with_limit(64), Err(lopdf::Error::Decompress(lopdf::DecompressError::Predictor(_)))),
+                "{bits}-bit row"
+            );
+        }
+    }
+
+    #[test]
+    fn tiff_subbyte_predictor_scratch_is_bounded_by_available_samples() {
+        // 1/2-bit row widths fit usize on 32- and 64-bit hosts; Colors previously made Vec<u16>
+        // reject the capacity before allocating. A partial row has no preceding pixel.
+        for bits in [1, 2] {
+            let data = vec![0b1010_0110; 64];
+            let stream = tiff_predictor_stream(data.clone(), 1, i64::try_from(isize::MAX).unwrap(), bits);
+            assert_eq!(stream.decompressed_content_with_limit(64).unwrap(), data, "{bits}-bit row");
+        }
+    }
+
+    #[test]
+    fn tiff_subbyte_predictors_keep_components_rows_and_padding() {
+        // Repeated tiny rows compress through the public Stream API. Rows remain independent,
+        // differences wrap at each component depth, and trailing padding bits survive.
+        for (columns, colors, bits, encoded, decoded) in [
+            (16, 1, 1, vec![255, 170, 8, 255], vec![170, 204, 15, 85]),
+            (6, 1, 2, vec![85, 179], vec![108, 147]),
+            (3, 1, 4, vec![25, 16], vec![26, 176]),
+            (2, 2, 4, vec![18, 34], vec![18, 52]),
+        ] {
+            let stream = tiff_predictor_stream(encoded.repeat(32), columns, colors, bits);
+            assert_eq!(stream.decompressed_content_with_limit(128).unwrap(), decoded.repeat(32), "{bits}-bit, {colors} colours");
+        }
+    }
+
+    // Xref-stream fixtures exercise indirect /Length lookup during document loading: stream 2's /Length is `3 0 R`,
+    // `containers` lists compressed (id, container, index) entries and `objects` the other objects in the file.
+    fn compressed_length_pdf(containers: &[(u32, u32, u16)], objects: &[(u32, &[u8])]) -> Vec<u8> {
+        let mut pdf = b"%PDF-1.7\n".to_vec();
+        let ids = containers.iter().flat_map(|&(id, container, _)| [id, container]).chain(objects.iter().map(|&(id, _)| id));
+        let xref_id = ids.max().unwrap_or(3) + 1;
+        let mut records = vec![[0u8; 7]; (xref_id + 1) as usize];
+        records[0] = [0, 0, 0, 0, 0, 255, 255];
+        let mut append = |id: u32, body: &[u8]| {
+            records[id as usize][0] = 1;
+            records[id as usize][1..5].copy_from_slice(&(pdf.len() as u32).to_be_bytes());
+            pdf.extend_from_slice(format!("{id} 0 obj\n").as_bytes());
+            pdf.extend_from_slice(body);
+            pdf.extend_from_slice(b"\nendobj\n");
+        };
+        append(1, b"<< /Type /Catalog >>");
+        append(2, b"<< /Length 3 0 R >>\nstream\nhello\nendstream");
+        for &(id, body) in objects {
+            append(id, body);
+        }
+        for &(id, container, index) in containers {
+            records[id as usize][0] = 2;
+            records[id as usize][1..5].copy_from_slice(&container.to_be_bytes());
+            records[id as usize][5..7].copy_from_slice(&index.to_be_bytes());
+        }
+        let xref_offset = pdf.len();
+        records[xref_id as usize][0] = 1;
+        records[xref_id as usize][1..5].copy_from_slice(&(xref_offset as u32).to_be_bytes());
+        pdf.extend_from_slice(
+            format!("{xref_id} 0 obj\n<< /Type /XRef /Size {} /Root 1 0 R /W [1 4 2] /Length {} >>\nstream\n", records.len(), records.len() * 7)
+                .as_bytes(),
+        );
+        for record in records {
+            pdf.extend_from_slice(&record);
+        }
+        pdf.extend_from_slice(format!("\nendstream\nendobj\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
+        pdf
+    }
+
+    // Stream 2's /Length starts a chain of `hops` indirect /Length lookups, each naming a new object; only the last
+    // link's /Length is direct. Compressed: link k is the integer 3 + 2k (the length it measures) alone in the object
+    // stream 4 + 2k, whose own /Length is link k + 1. Plain: link k is the stream 3 + k, whose /Length is link k + 1.
+    fn length_chain_pdf(hops: u32, compressed: bool) -> Vec<u8> {
+        let length = |hop: u32, next: u32, data: &str| if hop + 1 < hops { format!("{next} 0 R") } else { data.len().to_string() };
+        let (mut containers, mut objects) = (Vec::new(), Vec::new());
+        let mut value = 5; // the length of stream 2's data, "hello"
+        for hop in 0..hops {
+            if compressed {
+                let (id, container) = (3 + 2 * hop, 4 + 2 * hop);
+                let index = format!("{id} 0 ");
+                let data = format!("{index}{value}");
+                let dict = format!("/Type /ObjStm /N 1 /First {} /Length {}", index.len(), length(hop, id + 2, &data));
+                objects.push((container, format!("<< {dict} >>\nstream\n{data}\nendstream")));
+                containers.push((id, container, 0));
+                value = data.len();
+            } else {
+                objects.push((3 + hop, format!("<< /Length {} >>\nstream\n\nendstream", length(hop, 4 + hop, ""))));
+            }
+        }
+        let objects: Vec<_> = objects.iter().map(|(id, body)| (*id, body.as_bytes())).collect();
+        compressed_length_pdf(&containers, &objects)
+    }
+
+    // Lenient loading keeps a document whose stream 2 has an unresolvable /Length: the catalog, and stream 2's
+    // dictionary without its data.
+    fn load_without_stream_2_data(pdf: &[u8]) -> Document {
+        let doc = Document::load_mem(pdf).unwrap();
+        assert!(doc.catalog().unwrap().has_type(b"Catalog"));
+        assert!(doc.get_object((2, 0)).unwrap().as_stream().unwrap().content.is_empty());
+        doc
+    }
+
+    #[test]
+    fn compressed_object_self_container_does_not_recurse() {
+        let doc = load_without_stream_2_data(&compressed_length_pdf(&[(3, 3, 0)], &[]));
+        assert!(doc.get_object((3, 0)).is_err());
+    }
+
+    #[test]
+    fn compressed_object_mutual_containers_do_not_recurse() {
+        let doc = load_without_stream_2_data(&compressed_length_pdf(&[(3, 4, 0), (4, 3, 0)], &[]));
+        assert!(doc.get_object((3, 0)).is_err());
+        assert!(doc.get_object((4, 0)).is_err());
+    }
+
+    #[test]
+    fn object_stream_length_cycle_does_not_recurse() {
+        let pdf = compressed_length_pdf(&[(3, 4, 0)], &[(4, b"<< /Type /ObjStm /N 1 /First 4 /Length 3 0 R >>\nstream\n3 0 5\nendstream")]);
+        let doc = load_without_stream_2_data(&pdf);
+        // The container's /Length is the object it holds: the container is kept without data, so 3 never loads.
+        assert!(doc.get_object((4, 0)).unwrap().as_stream().unwrap().content.is_empty());
+        assert!(doc.get_object((3, 0)).is_err());
+    }
+
+    #[test]
+    fn compressed_object_container_chain_does_not_recurse() {
+        let containers: Vec<_> = (3..100_003).map(|id| (id, id + 1, 0)).collect();
+        let pdf = compressed_length_pdf(&containers, &[(100_003, b"<< /Type /ObjStm /N 1 /First 4 /Length 5 >>\nstream\n3 0 5\nendstream")]);
+        let doc = load_without_stream_2_data(&pdf);
+        // The object stream in the file loads, but the xref puts 3 in the compressed container 4, which is refused.
+        assert_eq!(doc.get_object((100_003, 0)).unwrap().as_stream().unwrap().content, b"3 0 5");
+        assert!(doc.get_object((3, 0)).is_err());
+    }
+
+    #[test]
+    fn compressed_objects_and_indirect_stream_length_still_load() {
+        let pdf = compressed_length_pdf(
+            &[(3, 4, 0), (5, 4, 1)],
+            &[(4, b"<< /Type /ObjStm /N 2 /First 8 /Length 17 >>\nstream\n3 0 5 2 5 (value)\nendstream")],
+        );
+        let doc = Document::load_mem_with_options(&pdf, LoadOptions { strict: true, ..Default::default() }).unwrap();
+        assert_eq!(doc.get_object((3, 0)).unwrap().as_i64().unwrap(), 5);
+        assert_eq!(doc.get_object((5, 0)).unwrap().as_str().unwrap(), b"value");
+        assert_eq!(doc.get_object((2, 0)).unwrap().as_stream().unwrap().content, b"hello");
+    }
+
+    #[test]
+    fn compressed_length_in_a_container_with_an_indirect_length_still_loads() {
+        // Two hops, as in a valid file: stream 2's /Length (3) is compressed in container 4, whose own /Length (5) is
+        // a plain indirect integer.
+        let pdf =
+            compressed_length_pdf(&[(3, 4, 0)], &[(4, b"<< /Type /ObjStm /N 1 /First 4 /Length 5 0 R >>\nstream\n3 0 5\nendstream"), (5, b"5")]);
+        let doc = Document::load_mem_with_options(&pdf, LoadOptions { strict: true, ..Default::default() }).unwrap();
+        assert_eq!(doc.get_object((3, 0)).unwrap().as_i64().unwrap(), 5);
+        assert_eq!(doc.get_object((5, 0)).unwrap().as_i64().unwrap(), 5);
+        assert_eq!(doc.get_object((2, 0)).unwrap().as_stream().unwrap().content, b"hello");
+    }
+
+    #[test]
+    fn compressed_length_chain_does_not_recurse() {
+        // Every container is an ordinary object in the file and every hop names a new object, so neither the
+        // container check nor the cycle history stops the chain; each hop recursed once more (a 512 KiB stack
+        // overflowed within 150 hops). Lookups past the cap fail: the first link never loads, while the last one,
+        // next to the direct /Length, does.
+        let hops = 5_000;
+        let doc = load_without_stream_2_data(&length_chain_pdf(hops, true));
+        assert!(doc.get_object((3, 0)).is_err());
+        assert!(doc.get_object((3 + 2 * (hops - 1), 0)).unwrap().as_i64().is_ok());
+        // The cap itself: loading link j reads its container's /Length, a chain of 2 * (hops - 1 - j) lookups, and
+        // 16 are allowed, so the 9th link from the end loads and the 10th does not.
+        assert!(doc.get_object((3 + 2 * (hops - 9), 0)).is_ok());
+        assert!(doc.get_object((3 + 2 * (hops - 10), 0)).is_err());
+    }
+
+    #[test]
+    fn plain_stream_length_chain_does_not_recurse() {
+        // The same recursion without object streams: each stream's /Length names the next stream (a 512 KiB stack
+        // overflowed within 200 hops). A stream is no length, so every link is kept as a stream without data.
+        let hops = 5_000;
+        let doc = load_without_stream_2_data(&length_chain_pdf(hops, false));
+        assert!((3..3 + hops).all(|id| doc.get_object((id, 0)).is_ok_and(|link| link.as_stream().is_ok_and(|s| s.content.is_empty()))));
+    }
+
+    fn indexed_object_stream(pairs: &[(u32, usize)], members: &[u8]) -> lopdf::Stream {
+        let mut content = Vec::new();
+        for &(id, offset) in pairs {
+            content.extend_from_slice(format!("{id} {offset} ").as_bytes());
+        }
+        let mut dict = Dictionary::new();
+        dict.set("Type", "ObjStm");
+        dict.set("N", pairs.len() as i64);
+        dict.set("First", content.len() as i64);
+        content.extend_from_slice(members);
+        lopdf::Stream::new(dict, content)
+    }
+
+    #[test]
+    fn object_stream_member_extents_bound_owned_strings() {
+        let mut members = vec![b'('; 32];
+        members.extend(vec![b'x'; 1 << 20]);
+        members.extend([b')'; 32]);
+        // Put the innermost (complete) string first in index order, then overlapping starts
+        // and duplicates. Only this first member at offset 31 may own the large string.
+        let mut pairs = vec![(100, 31)];
+        pairs.extend((0..31).map(|offset| (offset as u32 + 1, offset)));
+        pairs.extend([(200, 31), (201, 31)]);
+        let stream = indexed_object_stream(&pairs, &members);
+        let parsed = lopdf::ObjectStream::new_with_limit(&stream, Some(2 << 20)).unwrap();
+        assert_eq!(parsed.objects.get(&(100, 0)).unwrap().as_str().unwrap().len(), 1 << 20);
+        let total: usize = parsed.objects.values().filter_map(|object| object.as_str().ok()).map(<[u8]>::len).sum();
+        assert!(total <= stream.content.len(), "owned {total} string bytes from {} decoded bytes", stream.content.len());
+        assert!(!parsed.objects.contains_key(&(200, 0)));
+        assert!(!parsed.objects.contains_key(&(201, 0)));
+    }
+
+    #[test]
+    fn object_stream_member_extents_preserve_index_order_and_whitespace() {
+        let members = b" \n42\n /Name \n[true 7]\n << /Key (value) >>\n (last)";
+        // Unsorted offsets, and object 9 appears twice: its last index entry still wins.
+        let pairs = [(9, 0), (12, 21), (10, 5), (11, 12), (9, 41)];
+        let parsed = lopdf::ObjectStream::new(&indexed_object_stream(&pairs, members)).unwrap();
+        assert_eq!(parsed.objects.len(), 4);
+        assert_eq!(parsed.objects.get(&(9, 0)).unwrap().as_str().unwrap(), b"last");
+        assert_eq!(parsed.objects.get(&(10, 0)).unwrap().as_name().unwrap(), b"Name");
+        assert_eq!(parsed.objects.get(&(11, 0)).unwrap().as_array().unwrap(), &[Object::Boolean(true), Object::Integer(7)]);
+        assert_eq!(parsed.objects.get(&(12, 0)).unwrap().as_dict().unwrap().get(b"Key").unwrap().as_str().unwrap(), b"value");
+    }
+
+    #[test]
     fn view_and_user_space_round_trip_for_every_rotation() {
         for rotation in [0u16, 90, 180, 270] {
             let (w, h) = if rotation % 180 == 0 { (200.0, 300.0) } else { (300.0, 200.0) };
@@ -1136,131 +1608,197 @@ mod tests {
         assert_eq!(alpha(1, MAX_LABEL_BYTES).as_deref(), Some("a"));
         assert_eq!(alpha(27, MAX_LABEL_BYTES).as_deref(), Some("aa"));
         assert_eq!(alpha(53, MAX_LABEL_BYTES).as_deref(), Some("aaa"));
-        // Each length is checked against the byte budget before anything is repeated.
-        assert_eq!(roman(1_024_000, MAX_LABEL_BYTES).map(|s| s.len()), Some(MAX_LABEL_BYTES));
-        assert_eq!(roman(1_024_001, MAX_LABEL_BYTES), None);
-        assert_eq!(alpha(26 * 1024, MAX_LABEL_BYTES).map(|s| s.len()), Some(MAX_LABEL_BYTES));
-        assert_eq!(alpha(26 * 1024 + 1, MAX_LABEL_BYTES), None);
-        assert_eq!(roman(4, 2).as_deref(), Some("iv"));
-        assert_eq!(roman(4, 1), None);
-        for max in [0, MAX_LABEL_BYTES, usize::MAX] {
-            assert_eq!(roman(u64::MAX, max), None);
-            assert_eq!(alpha(u64::MAX, max), None);
+    }
+
+    // Synthetic label-only inspection fixtures: never construct an explosive branching tree.
+    fn label_info(nums: Vec<Object>, kids: Vec<Object>) -> DocInfo {
+        let mut doc = Document::with_version("1.7");
+        let mut tree = Dictionary::new();
+        tree.set("Nums", nums);
+        tree.set("Kids", kids);
+        doc.objects.insert((6, 0), Object::Dictionary(tree));
+        let mut catalog = Dictionary::new();
+        catalog.set("Type", Object::Name(b"Catalog".to_vec()));
+        catalog.set("PageLabels", Object::Reference((6, 0)));
+        doc.objects.insert((1, 0), Object::Dictionary(catalog));
+        doc.trailer.set("Root", Object::Reference((1, 0)));
+        let mut info = DocInfo {
+            pages: (1..=3)
+                .map(|n| PageInfo { width: 200.0, height: 300.0, crop: [0.0, 0.0, 200.0, 300.0], rotation: 0, label: n.to_string() })
+                .collect(),
+            ..Default::default()
+        };
+        Inspector::new(&doc).fill(&mut info);
+        info
+    }
+
+    fn label_spec(style: &str, prefix: Vec<u8>, first: i64) -> Object {
+        let mut d = Dictionary::new();
+        d.set("S", Object::Name(style.as_bytes().to_vec()));
+        d.set("P", Object::String(prefix, lopdf::StringFormat::Hexadecimal));
+        d.set("St", first);
+        Object::Dictionary(d)
+    }
+
+    fn assert_label_fallback(info: &DocInfo) {
+        assert_eq!(info.pages.iter().map(|p| p.label.as_str()).collect::<Vec<_>>(), ["1", "2", "3"]);
+        assert_eq!(info.warnings.len(), 1, "{:?}", info.warnings);
+        assert!(info.warnings[0].contains("Page labels"), "{:?}", info.warnings);
+        assert!(info.warnings[0].contains("physical page numbers"), "{:?}", info.warnings);
+    }
+
+    #[test]
+    fn page_label_limits_keep_normal_pdf_numbering() {
+        for (style, first, expected) in [
+            ("r", 4, ["iv", "v", "vi"]),
+            ("R", 1994, ["MCMXCIV", "MCMXCV", "MCMXCVI"]),
+            ("a", 26, ["z", "aa", "bb"]),
+            ("A", 52, ["ZZ", "AAA", "BBB"]),
+        ] {
+            let info = label_info(vec![Object::Integer(0), label_spec(style, Vec::new(), first)], Vec::new());
+            assert_eq!(info.pages.iter().map(|p| p.label.as_str()).collect::<Vec<_>>(), expected);
+            assert!(info.warnings.is_empty(), "{:?}", info.warnings);
         }
     }
 
-    /// A PDF of `pages` blank pages whose catalog's `/PageLabels` is `labels`, with `extra`
-    /// objects, numbered from 10, for the label tree to refer to.
-    fn with_labels(pages: usize, labels: &str, extra: &[&str]) -> Vec<u8> {
-        let kids: Vec<String> = (0..pages).map(|i| format!("{} 0 R", 100 + i)).collect();
-        let mut pdf = format!(
-            "%PDF-1.7\n1 0 obj << /Type /Catalog /Pages 2 0 R /PageLabels {labels} >> endobj\n2 0 obj << /Type /Pages /Kids [{}] /Count {pages} >> endobj\n",
-            kids.join(" ")
-        );
-        for (i, body) in extra.iter().enumerate() {
-            pdf.push_str(&format!("{} 0 obj {body} endobj\n", 10 + i));
+    #[test]
+    fn page_label_limits_reject_long_prefixes_without_partial_labels() {
+        for prefix in [vec![b'x'; 1025], vec![b'x'; 2051]] {
+            let nums = vec![Object::Integer(0), label_spec("D", b"ok-".to_vec(), 1), Object::Integer(1), label_spec("D", prefix, 1)];
+            assert_label_fallback(&label_info(nums, Vec::new()));
         }
-        for i in 0..pages {
-            pdf.push_str(&format!("{} 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >> endobj\n", 100 + i));
-        }
-        pdf.push_str("trailer << /Root 1 0 R >>\n%%EOF");
-        pdf.into_bytes()
     }
 
-    fn labels(info: &DocInfo) -> Vec<&str> {
-        info.pages.iter().map(|p| p.label.as_str()).collect()
+    #[test]
+    fn page_label_limits_count_decoded_utf8_bytes() {
+        let mut prefix = vec![0xfe, 0xff];
+        for _ in 0..342 {
+            prefix.extend_from_slice(&0x2022u16.to_be_bytes());
+        }
+        assert_label_fallback(&label_info(vec![Object::Integer(0), label_spec("", prefix, 1)], Vec::new()));
     }
 
-    /// `page_labels` on `pages` pages (labelled 1, 2, 3…) of `pdf`'s `/PageLabels`.
-    fn labels_on(pdf: &[u8], pages: usize) -> (Vec<String>, Result<Vec<String>, &'static str>) {
-        let doc = Document::load_mem(pdf).expect("loads");
-        let mut info: Vec<PageInfo> = (0..pages)
-            .map(|i| PageInfo { width: 200.0, height: 200.0, label: (i + 1).to_string(), crop: [0.0, 0.0, 200.0, 200.0], rotation: 0 })
+    #[test]
+    fn page_label_limits_bound_roman_and_alpha_output() {
+        // Just 1025 output bytes on the old path, so RED does not consume excessive memory.
+        for (style, first) in [("r", 1_025_000), ("a", 26 * 1024 + 1)] {
+            assert_label_fallback(&label_info(vec![Object::Integer(0), label_spec(style, Vec::new(), first)], Vec::new()));
+        }
+    }
+
+    #[test]
+    fn page_label_limits_detect_one_node_cycle() {
+        let nums = vec![Object::Integer(0), label_spec("D", b"custom-".to_vec(), 1)];
+        assert_label_fallback(&label_info(nums, vec![Object::Reference((6, 0))]));
+    }
+
+    #[test]
+    fn page_label_limits_accept_utf16_ascii_at_the_output_boundary() {
+        let mut prefix = vec![0xfe, 0xff];
+        for _ in 0..1023 {
+            prefix.extend_from_slice(&u16::from(b'x').to_be_bytes());
+        }
+        let info = label_info(vec![Object::Integer(0), label_spec("D", prefix, 1)], Vec::new());
+        assert!(info.warnings.is_empty(), "{:?}", info.warnings);
+        assert_eq!(info.pages[0].label, format!("{}1", "x".repeat(1023)));
+        assert!(info.pages.iter().all(|p| p.label.len() == MAX_LABEL_BYTES));
+    }
+
+    #[test]
+    fn page_label_limits_refuse_hostile_numbers_before_allocating() {
+        for style in ["r", "R", "a", "A"] {
+            assert_label_fallback(&label_info(vec![Object::Integer(0), label_spec(style, Vec::new(), i64::MAX)], Vec::new()));
+        }
+        // Decimal labels remain small even when their first number exceeds 32-bit usize.
+        let info = label_info(vec![Object::Integer(0), label_spec("D", Vec::new(), i64::MAX)], Vec::new());
+        assert_eq!(info.pages[0].label, i64::MAX.to_string());
+        assert_eq!(info.pages[1].label, (i64::MAX as u64 + 1).to_string());
+        assert!(info.warnings.is_empty());
+    }
+
+    #[test]
+    fn page_label_limits_bound_wide_number_trees() {
+        assert_label_fallback(&label_info(Vec::new(), vec![Object::Null; MAX_LABEL_TREE_WORK + 1]));
+        let pair = [Object::Integer(0), label_spec("D", Vec::new(), 1)];
+        let nums = (0..MAX_LABEL_TREE_WORK).flat_map(|_| pair.clone()).collect();
+        assert_label_fallback(&label_info(nums, Vec::new()));
+    }
+
+    #[test]
+    fn page_label_limits_bound_total_custom_output_atomically() {
+        let doc = Document::with_version("1.7");
+        let mut tree = Dictionary::new();
+        tree.set("Nums", vec![Object::Integer(0), label_spec("", vec![b'x'; MAX_LABEL_BYTES], 1)]);
+        let mut catalog = Dictionary::new();
+        catalog.set("PageLabels", Object::Dictionary(tree));
+        let count = MAX_LABEL_TOTAL_BYTES / MAX_LABEL_BYTES + 1;
+        let mut pages: Vec<_> = (1..=count)
+            .map(|n| PageInfo { width: 200.0, height: 300.0, crop: [0.0, 0.0, 200.0, 300.0], rotation: 0, label: n.to_string() })
             .collect();
-        let result = Inspector::new(&doc).page_labels(doc.catalog().expect("a catalog"), &mut info);
-        (info.into_iter().map(|p| p.label).collect(), result)
+        let err = Inspector::new(&doc).page_labels(&catalog, &mut pages).unwrap_err();
+        assert!(err.contains("4 MiB"), "{err}");
+        assert!(pages.iter().enumerate().all(|(i, p)| p.label == (i + 1).to_string()));
+        // Exact aggregate boundary remains supported.
+        pages.pop();
+        Inspector::new(&doc).page_labels(&catalog, &mut pages).unwrap();
+        assert!(pages.iter().all(|p| p.label.len() == MAX_LABEL_BYTES));
     }
 
     #[test]
-    fn page_labels_follow_the_number_tree() {
-        let info = inspect(Arc::new(with_labels(6, "<< /Nums [0 << /S /r >> 2 << /S /D >> 4 << /S /A /P (App-) >>] >>", &[])), None).expect("opens");
-        assert_eq!(labels(&info), ["i", "ii", "1", "2", "App-A", "App-B"]);
-        assert!(info.warnings.is_empty(), "{:?}", info.warnings);
-    }
-
-    /// About 300 bytes asking for page 2^63 - 1 in letters: a label of 354,745,078,340,568,301
-    /// letters, whose allocation aborted the process (an abort, not a panic `inspect` can catch).
-    const HOSTILE_LABEL: &[u8] = b"%PDF-1.7
-1 0 obj << /Type /Catalog /Pages 2 0 R /PageLabels << /Nums [0 << /S /a /St 9223372036854775807 >>] >> >> endobj
-2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj
-3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >> endobj
-trailer << /Root 1 0 R >>
-%%EOF";
-
-    #[test]
-    fn a_hostile_page_label_number_opens_with_the_physical_page_number() {
-        let info = inspect(Arc::new(HOSTILE_LABEL.to_vec()), None).expect("opens");
-        assert_eq!(labels(&info), ["1"]);
-        assert_eq!(info.warnings, ["Page labels: the labels from page 1 are longer than 1024 bytes, so those pages show their physical numbers."]);
+    fn page_label_limits_handle_prefix_only_and_reference_cycles() {
+        let info = label_info(vec![Object::Integer(0), label_spec("", b"prefix".to_vec(), i64::MAX)], Vec::new());
+        assert!(info.warnings.is_empty());
+        assert!(info.pages.iter().all(|p| p.label == "prefix"));
+        let mut doc = Document::with_version("1.7");
+        doc.objects.insert((6, 0), Object::Reference((6, 0)));
+        let mut catalog = Dictionary::new();
+        catalog.set("PageLabels", Object::Reference((6, 0)));
+        assert!(Inspector::new(&doc).page_labels(&catalog, &mut []).unwrap_err().contains("cyclic"));
     }
 
     #[test]
-    fn every_numbering_style_takes_page_numbers_up_to_i64_max() {
-        // A range per page, each starting at 2^63 - 1: letters and Roman numerals that long
-        // aren't made; decimal digits are.
-        let max = i64::MAX;
-        let nums = format!(
-            "<< /Nums [0 << /S /a /St {max} >> 1 << /S /A /St {max} >> 2 << /S /r /St {max} >> 3 << /S /R /St {max} >> 4 << /S /D /St {max} >>] >>"
-        );
-        let info = inspect(Arc::new(with_labels(5, &nums, &[])), None).expect("opens");
-        assert_eq!(labels(&info), ["1", "2", "3", "4", "9223372036854775807"]);
-        assert_eq!(
-            info.warnings,
-            ["Page labels: the labels from page 1 and 3 other ranges are longer than 1024 bytes, so those pages show their physical numbers."]
-        );
+    fn page_label_limits_bound_depth_and_count_combined_work() {
+        for depth in [MAX_LABEL_TREE_DEPTH, MAX_LABEL_TREE_DEPTH + 1] {
+            let mut child = Dictionary::new();
+            child.set("Nums", vec![Object::Integer(0), label_spec("D", b"custom-".to_vec(), 1)]);
+            let mut child = Object::Dictionary(child);
+            for _ in 1..depth {
+                let mut parent = Dictionary::new();
+                parent.set("Kids", vec![child]);
+                child = Object::Dictionary(parent);
+            }
+            let info = label_info(Vec::new(), vec![child]);
+            if depth == MAX_LABEL_TREE_DEPTH {
+                assert!(info.warnings.is_empty());
+                assert_eq!(info.pages[0].label, "custom-1");
+            } else {
+                assert_label_fallback(&info);
+            }
+        }
+        // Each array alone fits: their combined work still must be bounded.
+        let half = MAX_LABEL_TREE_WORK / 2;
+        let spec = label_spec("D", Vec::new(), 1);
+        let nums = (0..half).flat_map(|i| [Object::Integer(i as i64), spec.clone()]).collect();
+        assert_label_fallback(&label_info(nums, vec![Object::Null; half]));
     }
 
     #[test]
-    fn page_label_prefixes_and_totals_are_bounded() {
-        let x = |n: usize| "x".repeat(n);
-        // A raw prefix over 2050 bytes, a decoded one over 1024, and a prefix whose number takes
-        // the label past 1024: those pages keep their physical numbers. 1024 bytes exactly is shown.
-        let nums = format!(
-            "<< /Nums [0 << /S /D /P ({}) >> 1 << /S /D /P ({}) >> 2 << /S /D /P ({}) >> 3 << /S /D /P ({}) >>] >>",
-            x(3000),
-            x(1500),
-            x(1024),
-            x(1023)
-        );
-        let info = inspect(Arc::new(with_labels(4, &nums, &[])), None).expect("opens");
-        assert_eq!(labels(&info), ["1", "2", "3", format!("{}1", x(1023)).as_str()]);
-        assert_eq!(
-            info.warnings,
-            ["Page labels: the labels from page 1 and 2 other ranges are longer than 1024 bytes, so those pages show their physical numbers."]
-        );
-        // Labels of about 1,000 bytes on 4,200 pages: over 4 MiB in all, so none is applied.
-        let (labels, result) = labels_on(&with_labels(1, &format!("<< /Nums [0 << /S /D /P ({}) >>] >>", x(1000)), &[]), 4200);
-        assert_eq!(result, Err("the labels take more than 4 MiB in all"));
-        assert!(labels.iter().enumerate().all(|(i, l)| *l == (i + 1).to_string()), "physical numbers");
-        // One 1,000-byte prefix shared by 5,000 ranges: refused before any label is made.
-        let nums: String = (0..5000).map(|i| format!("{i} << /S /D /P 10 0 R >> ")).collect();
-        let (_, result) = labels_on(&with_labels(1, &format!("<< /Nums [{nums}] >>"), &[&format!("({})", x(1000))]), 5000);
-        assert_eq!(result, Err("the label prefixes take more than 4 MiB in all"));
+    fn page_label_limits_keep_the_later_of_duplicate_ranges() {
+        let nums = vec![Object::Integer(0), label_spec("D", b"first-".to_vec(), 1), Object::Integer(0), label_spec("D", b"last-".to_vec(), 1)];
+        let info = label_info(nums, Vec::new());
+        assert_eq!(info.pages.iter().map(|p| p.label.as_str()).collect::<Vec<_>>(), ["last-1", "last-2", "last-3"]);
+        assert_eq!(info.warnings.len(), 1, "{:?}", info.warnings);
+        assert!(info.warnings[0].contains("twice"), "{:?}", info.warnings);
     }
 
     #[test]
-    fn page_label_trees_are_read_once_per_node_within_a_budget() {
-        // A node naming itself three times was walked 3^32 times; each node is read once.
-        let pdf = with_labels(3, "10 0 R", &["<< /Kids [10 0 R 10 0 R 10 0 R] /Nums [0 << /S /r >>] >>"]);
-        let info = inspect(Arc::new(pdf), None).expect("opens");
-        assert_eq!(labels(&info), ["i", "ii", "iii"]);
-        assert!(info.warnings.is_empty(), "{:?}", info.warnings);
-        // 200,000 kids: past the budget for the whole tree, so no label is applied.
-        let kids = "11 0 R ".repeat(MAX_LABEL_TREE_WORK);
-        let pdf = with_labels(2, "10 0 R", &[&format!("<< /Kids [{kids}] >>"), "<< /Nums [0 << /S /r >>] >>"]);
-        let info = inspect(Arc::new(pdf), None).expect("opens");
-        assert_eq!(labels(&info), ["1", "2"]);
-        assert_eq!(info.warnings, ["Page labels were skipped: the number tree is too large; using physical page numbers."]);
+    fn page_label_limits_keep_other_ranges_when_one_is_too_long() {
+        // Page 1 is labelled normally; pages 2–3 would need over 1024 bytes of roman numerals.
+        let nums = vec![Object::Integer(0), label_spec("D", b"ok-".to_vec(), 1), Object::Integer(1), label_spec("r", Vec::new(), 1_025_000)];
+        let info = label_info(nums, Vec::new());
+        assert_eq!(info.pages.iter().map(|p| p.label.as_str()).collect::<Vec<_>>(), ["ok-1", "2", "3"]);
+        assert_eq!(info.warnings.len(), 1, "{:?}", info.warnings);
+        assert!(info.warnings[0].contains("physical page numbers"), "{:?}", info.warnings);
     }
 
     const ATTACHMENTS: &[u8] = b"%PDF-1.7
@@ -1317,6 +1855,53 @@ trailer << /Root 1 0 R >>
         assert_eq!(info.layer_groups, [vec![(5, 0), (6, 0)], vec![(6, 0), (7, 0)]]);
     }
 
+    const ORPHAN_FIELDS: &[u8] = b"%PDF-1.7
+1 0 obj << /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >> endobj
+2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj
+3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Annots [5 0 R 6 0 R] >> endobj
+4 0 obj << /Fields [] >> endobj
+5 0 obj << /Type /Annot /Subtype /Widget /FT /Tx /T (alpha) /V (one) /Rect [10 100 90 120] >> endobj
+6 0 obj << /Type /Annot /Subtype /Widget /FT /Tx /T (beta) /Rect [10 60 90 80] >> endobj
+trailer << /Root 1 0 R >>
+%%EOF";
+
+    #[test]
+    fn fields_listed_only_on_the_pages_are_listed() {
+        let info = inspect(Arc::new(ORPHAN_FIELDS.to_vec()), None).expect("opens");
+        let listed: Vec<_> = info.fields.iter().map(|f| (f.name.as_str(), f.value.as_deref(), f.page)).collect();
+        assert_eq!(listed, [("alpha", Some("one"), Some(0)), ("beta", None, Some(0))], "{:?}", info.fields);
+    }
+
+    #[test]
+    fn lazy_structure_matches_the_compatibility_inspector() {
+        // Each fixture as lopdf writes it, and with its objects in object streams.
+        let packed = |bytes: &[u8]| {
+            let doc = pdfcraft_cos::Document::open(Arc::new(bytes.to_vec())).unwrap();
+            pdfcraft_cos::write_full(&doc, &pdfcraft_cos::SaveOptions { object_streams: true, ..Default::default() }).unwrap()
+        };
+        let fixtures = [ATTACHMENTS, LAYERS, DESTS].into_iter().flat_map(|bytes| {
+            let mut original = Document::load_mem(bytes).unwrap();
+            let mut plain = Vec::new();
+            original.save_to(&mut plain).unwrap();
+            let stm = packed(&plain);
+            [plain, stm]
+        });
+        for bytes in fixtures {
+            let lazy = LazyStructure::new(Arc::new(bytes.clone()), None).unwrap();
+            let eager = Document::load_mem(&bytes).unwrap();
+            let mut a = inspect(Arc::new(bytes), None).unwrap();
+            let mut b = DocInfo { pages: a.pages.clone(), ..Default::default() };
+            let mut c = DocInfo { pages: a.pages.clone(), ..Default::default() };
+            Inspector::new(&lazy).fill(&mut b);
+            Inspector::new(&eager).fill(&mut c);
+            assert!(!lazy.failed());
+            assert_eq!(format!("{b:?}"), format!("{c:?}"));
+            a.file_size = 0;
+            a.pdf_version.clear();
+            assert_eq!(format!("{a:?}"), format!("{c:?}"));
+        }
+    }
+
     #[test]
     fn links_read_set_layer_actions() {
         let info = inspect(Arc::new(LAYERS.to_vec()), None).expect("opens");
@@ -1332,6 +1917,232 @@ trailer << /Root 1 0 R >>
                 LinkTarget::SetLayers { changes: vec![(Off, (5, 0))], preserve_rb: true },
             ]
         );
+    }
+
+    #[test]
+    fn destination_operands_become_views() {
+        use DestView::*;
+        let v = |kind: &[u8], ops: &[Option<f32>]| DestView::from_operands(Some(kind), ops);
+        // ISO 32000-2 Table 149, each type.
+        assert_eq!(v(b"XYZ", &[Some(0.0), Some(420.0), Some(0.0)]), Xyz { left: Some(0.0), top: Some(420.0), zoom: None });
+        assert_eq!(v(b"XYZ", &[Some(72.0), Some(500.0), Some(1.5)]), Xyz { left: Some(72.0), top: Some(500.0), zoom: Some(1.5) });
+        assert_eq!(v(b"Fit", &[]), Fit);
+        assert_eq!(v(b"FitB", &[]), Fit);
+        assert_eq!(v(b"FitH", &[Some(250.0)]), FitH { top: Some(250.0) });
+        assert_eq!(v(b"FitBH", &[None]), FitH { top: None });
+        assert_eq!(v(b"FitV", &[Some(120.0)]), FitV { left: Some(120.0) });
+        assert_eq!(v(b"FitBV", &[Some(5.0)]), FitV { left: Some(5.0) });
+        // FitR's corners are normalized.
+        assert_eq!(v(b"FitR", &[Some(110.0), Some(220.0), Some(10.0), Some(20.0)]), FitR { rect: [10.0, 20.0, 110.0, 220.0] });
+        // Missing operands are null; so are non-finite ones, and a zoom that isn't positive.
+        assert_eq!(v(b"XYZ", &[]), Xyz { left: None, top: None, zoom: None });
+        assert_eq!(v(b"XYZ", &[Some(f32::NAN), Some(f32::INFINITY), Some(f32::NEG_INFINITY)]), Xyz { left: None, top: None, zoom: None });
+        assert_eq!(v(b"XYZ", &[None, Some(-5.0), Some(-1.0)]), Xyz { left: None, top: Some(-5.0), zoom: None });
+        assert_eq!(v(b"XYZ", &[None, None, Some(f32::NAN)]), Xyz { left: None, top: None, zoom: None });
+        assert_eq!(v(b"FitH", &[Some(f32::NAN)]), FitH { top: None });
+        // A FitR without four usable numbers, an unknown type or no type: the top of the page.
+        assert_eq!(v(b"FitR", &[Some(1.0), Some(2.0)]), Top);
+        assert_eq!(v(b"FitR", &[Some(1.0), Some(2.0), Some(f32::INFINITY), Some(4.0)]), Top);
+        assert_eq!(v(b"Zoom", &[Some(3.0)]), Top);
+        assert_eq!(v(b"xyz", &[Some(3.0)]), Top);
+        assert_eq!(DestView::from_operands(None, &[Some(1.0)]), Top);
+    }
+
+    /// Two 300×400 pages. Bookmarks and links on page 1 go to page 2 in every destination form,
+    /// named (`/Names /Dests` and the PDF 1.1 `/Dests`) and malformed.
+    const DESTS: &[u8] = b"%PDF-1.7
+1 0 obj << /Type /Catalog /Pages 2 0 R /Outlines 10 0 R /Names << /Dests 40 0 R >> /Dests << /old << /D [4 0 R /FitV 120] >> >> >> endobj
+2 0 obj << /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 300 400] >> endobj
+3 0 obj << /Type /Page /Parent 2 0 R /Annots [30 0 R 31 0 R 32 0 R 33 0 R] >> endobj
+4 0 obj << /Type /Page /Parent 2 0 R >> endobj
+10 0 obj << /Type /Outlines /First 11 0 R /Last 20 0 R /Count 10 >> endobj
+11 0 obj << /Title (xyz) /Parent 10 0 R /Next 12 0 R /Dest [4 0 R /XYZ 0 420 0] >> endobj
+12 0 obj << /Title (fith) /Parent 10 0 R /Next 13 0 R /Dest [4 0 R /FitH 250] >> endobj
+13 0 obj << /Title (named) /Parent 10 0 R /Next 14 0 R /Dest (sec) >> endobj
+14 0 obj << /Title (old named) /Parent 10 0 R /Next 15 0 R /Dest /old >> endobj
+15 0 obj << /Title (action) /Parent 10 0 R /Next 16 0 R /A << /S /GoTo /D [4 0 R /FitR 110 220 10 20] >> >> endobj
+16 0 obj << /Title (wrong types) /Parent 10 0 R /Next 17 0 R /Dest [4 0 R /XYZ (left) /Top true] >> endobj
+17 0 obj << /Title (short) /Parent 10 0 R /Next 18 0 R /Dest [4 0 R /FitR 1 2] >> endobj
+18 0 obj << /Title (no type) /Parent 10 0 R /Next 19 0 R /Dest [4 0 R] >> endobj
+19 0 obj << /Title (huge) /Parent 10 0 R /Next 20 0 R /Dest [4 0 R /XYZ 1000000000000 -5 -1] >> endobj
+20 0 obj << /Title (no page) /Parent 10 0 R /Dest [/XYZ 0 420 0] >> endobj
+30 0 obj << /Type /Annot /Subtype /Link /Rect [0 0 10 10] /Dest [4 0 R /XYZ 72 500 1.5] >> endobj
+31 0 obj << /Type /Annot /Subtype /Link /Rect [0 20 10 30] /A << /S /GoTo /D (sec) >> >> endobj
+32 0 obj << /Type /Annot /Subtype /Link /Rect [0 40 10 50] /Dest [4 0 R /FitBH 100] >> endobj
+33 0 obj << /Type /Annot /Subtype /Link /Rect [0 60 10 70] /Dest [4 0 R /Fit] >> endobj
+40 0 obj << /Names [(sec) << /D [4 0 R /XYZ null 300 2] >>] >> endobj
+trailer << /Root 1 0 R >>
+%%EOF";
+
+    #[test]
+    fn bookmarks_and_links_keep_their_destination_view() {
+        use DestView::*;
+        let info = inspect(Arc::new(DESTS.to_vec()), None).expect("opens");
+        let outline: Vec<_> = info.outline.iter().map(|o| (o.title.as_str(), o.page, o.view)).collect();
+        assert_eq!(
+            outline,
+            [
+                ("xyz", Some(1), Xyz { left: Some(0.0), top: Some(420.0), zoom: None }),
+                ("fith", Some(1), FitH { top: Some(250.0) }),
+                ("named", Some(1), Xyz { left: None, top: Some(300.0), zoom: Some(2.0) }),
+                ("old named", Some(1), FitV { left: Some(120.0) }),
+                ("action", Some(1), FitR { rect: [10.0, 20.0, 110.0, 220.0] }),
+                // Hostile operands fall back without failing the bookmark.
+                ("wrong types", Some(1), Xyz { left: None, top: None, zoom: None }),
+                ("short", Some(1), Top),
+                ("no type", Some(1), Top),
+                ("huge", Some(1), Xyz { left: Some(1e12), top: Some(-5.0), zoom: None }),
+                ("no page", None, Top),
+            ]
+        );
+        let links: Vec<_> = info.links.iter().map(|l| l.target.clone()).collect();
+        assert_eq!(
+            links,
+            [
+                LinkTarget::Page(1, Xyz { left: Some(72.0), top: Some(500.0), zoom: Some(1.5) }),
+                LinkTarget::Page(1, Xyz { left: None, top: Some(300.0), zoom: Some(2.0) }),
+                LinkTarget::Page(1, FitH { top: Some(100.0) }),
+                LinkTarget::Page(1, Fit),
+            ]
+        );
+    }
+
+    #[test]
+    fn outline_titles_decode_every_text_string_encoding() {
+        // Issue #142: CJK bookmark titles showed as mojibake or with a stray BOM.
+        let pdf = b"%PDF-1.7
+1 0 obj << /Type /Catalog /Pages 2 0 R /Outlines 10 0 R >> endobj
+2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 300 400] >> endobj
+3 0 obj << /Type /Page /Parent 2 0 R >> endobj
+10 0 obj << /Type /Outlines /First 11 0 R /Last 16 0 R /Count 6 >> endobj
+11 0 obj << /Title <FEFF7B2C4E007AE0> /Parent 10 0 R /Next 12 0 R /Dest [3 0 R /Fit] >> endobj
+12 0 obj << /Title <EFBBBFE79BAEE5BD95> /Parent 10 0 R /Next 13 0 R /Dest [3 0 R /Fit] >> endobj
+13 0 obj << /Title <EFBBBF41FF42> /Parent 10 0 R /Next 14 0 R /Dest [3 0 R /Fit] >> endobj
+14 0 obj << /Title <E6A682E8BFB0> /Parent 10 0 R /Next 15 0 R /Dest [3 0 R /Fit] >> endobj
+15 0 obj << /Title <436166E9> /Parent 10 0 R /Next 16 0 R /Dest [3 0 R /Fit] >> endobj
+16 0 obj << /Title <FEFFFEFF0041> /Parent 10 0 R /Dest [3 0 R /Fit] >> endobj
+trailer << /Root 1 0 R >>
+%%EOF";
+        let info = inspect(Arc::new(pdf.to_vec()), None).expect("opens");
+        let titles: Vec<_> = info.outline.iter().map(|o| o.title.as_str()).collect();
+        // UTF-16BE, UTF-8 with BOM, invalid UTF-8 after a BOM (lossy, not dropped), BOM-less
+        // raw UTF-8, PDFDocEncoding Latin-1, and a doubled BOM.
+        assert_eq!(titles, ["第一章", "目录", "A\u{FFFD}B", "概述", "Café", "A"]);
+    }
+
+    /// A file whose objects are `bodies` in order (object 1 first), with a cross-reference table.
+    fn pdf_of(bodies: &[String]) -> Vec<u8> {
+        let mut out = b"%PDF-1.7\n".to_vec();
+        let mut offsets = Vec::new();
+        for (i, body) in bodies.iter().enumerate() {
+            offsets.push(out.len());
+            out.extend_from_slice(format!("{} 0 obj\n{body}\nendobj\n", i + 1).as_bytes());
+        }
+        let xref = out.len();
+        out.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", bodies.len() + 1).as_bytes());
+        for o in offsets {
+            out.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
+        }
+        out.extend_from_slice(format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", bodies.len() + 1).as_bytes());
+        out
+    }
+
+    /// A one-page file whose outline is `items` (objects 5, 6, … in order).
+    fn outline_file(items: &[String]) -> Vec<u8> {
+        let mut bodies = vec![
+            "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 300 400] >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R >>".to_string(),
+            format!("<< /Type /Outlines /First 5 0 R /Count {} >>", items.len()),
+        ];
+        bodies.extend(items.iter().cloned());
+        pdf_of(&bodies)
+    }
+
+    /// The titles of `items`, with children in brackets (`Parent[Child]`).
+    fn shape(items: &[OutlineItem]) -> Vec<String> {
+        items.iter().map(|o| if o.children.is_empty() { o.title.clone() } else { format!("{}[{}]", o.title, shape(&o.children).join(",")) }).collect()
+    }
+
+    #[test]
+    fn outline_window_keeps_the_first_bookmarks_and_says_when_more_follow() {
+        const COUNT: usize = OUTLINE_WINDOW + 5;
+        let items: Vec<String> = (0..COUNT)
+            .map(|k| {
+                let prev = if k == 0 { String::new() } else { format!(" /Prev {} 0 R", 4 + k) };
+                let next = if k + 1 == COUNT { String::new() } else { format!(" /Next {} 0 R", 6 + k) };
+                format!("<< /Title (Item {k}) /Parent 4 0 R{prev}{next} /Dest [3 0 R /Fit] >>")
+            })
+            .collect();
+        let info = inspect(Arc::new(outline_file(&items)), None).expect("opens");
+        assert_eq!(info.outline.len(), OUTLINE_WINDOW);
+        assert_eq!(info.outline.last().map(|o| o.title.as_str()), Some("Item 9999"));
+        assert!(info.outline_more);
+
+        let one = inspect(Arc::new(outline_file(&["<< /Title (Only) /Parent 4 0 R /Dest [3 0 R /Fit] >>".into()])), None).expect("opens");
+        assert_eq!(shape(&one.outline), ["Only"]);
+        assert!(!one.outline_more);
+    }
+
+    #[test]
+    fn outline_window_nests_no_deeper_than_its_depth_limit() {
+        // A chain of 40 bookmarks, each the first child of the one before.
+        let items: Vec<String> = (0..40)
+            .map(|k| {
+                let parent = if k == 0 { 4 } else { 4 + k };
+                let first = if k + 1 == 40 { String::new() } else { format!(" /First {} 0 R", 6 + k) };
+                format!("<< /Title (Deep {k}) /Parent {parent} 0 R{first} /Dest [3 0 R /Fit] >>")
+            })
+            .collect();
+        let info = inspect(Arc::new(outline_file(&items)), None).expect("opens");
+        let mut levels = 0;
+        let mut level = info.outline.first();
+        while let Some(item) = level {
+            levels += 1;
+            level = item.children.first();
+        }
+        assert_eq!(levels, OUTLINE_DEPTH + 1);
+        assert!(info.outline_more);
+    }
+
+    #[test]
+    fn outline_window_ends_cycles_and_broken_links_without_looping() {
+        let listed = |items: &[&str]| {
+            let items: Vec<String> = items.iter().map(|s| s.to_string()).collect();
+            shape(&inspect(Arc::new(outline_file(&items)), None).expect("opens").outline)
+        };
+        assert_eq!(listed(&["<< /Title (Self) /Parent 4 0 R /Next 5 0 R >>"]), ["Self"]);
+        assert_eq!(listed(&["<< /Title (Self) /Parent 4 0 R /First 5 0 R >>"]), ["Self"]);
+        assert_eq!(listed(&["<< /Title (A) /Parent 4 0 R /Next 6 0 R >>", "<< /Title (B) /Parent 4 0 R /Next 5 0 R >>"]), ["A", "B"]);
+        assert_eq!(listed(&["<< /Title (A) /Parent 4 0 R /First 6 0 R >>", "<< /Title (B) /Parent 5 0 R /First 5 0 R >>"]), ["A[B]"]);
+        assert_eq!(listed(&["<< /Title (A) /Parent 4 0 R /Next 99 0 R >>"]), ["A"]);
+        assert_eq!(listed(&["<< /Title (A) /Parent 4 0 R /Next 6 0 R >>", "42"]), ["A"]);
+    }
+
+    #[test]
+    fn destination_points_map_to_the_displayed_page() {
+        // A crop box away from the origin: x 100..400, y 50..450.
+        let mut p = PageInfo { width: 300.0, height: 400.0, label: "1".into(), crop: [100.0, 50.0, 400.0, 450.0], rotation: 0 };
+        assert_eq!(p.dest_fraction(Some(100.0), Some(450.0), 0), [Some(0.0), Some(0.0)]);
+        assert_eq!(p.dest_fraction(Some(250.0), Some(350.0), 0), [Some(0.5), Some(0.25)]);
+        // Unspecified stays unspecified; off-page and huge values are clamped to the page.
+        assert_eq!(p.dest_fraction(None, Some(350.0), 0), [None, Some(0.25)]);
+        assert_eq!(p.dest_fraction(Some(-1e30), Some(1e30), 0), [Some(0.0), Some(0.0)]);
+        assert_eq!(p.dest_fraction(Some(f32::INFINITY), Some(f32::NAN), 0), [None, None]);
+        // /Rotate 90 (clockwise): user y runs left to right across the displayed page, user x
+        // top to bottom. A view rotation adds to it.
+        p.rotation = 90;
+        assert_eq!(p.dest_fraction(Some(250.0), Some(350.0), 0), [Some(0.75), Some(0.5)]);
+        assert_eq!(p.dest_fraction(None, Some(350.0), 0), [Some(0.75), None]);
+        assert_eq!(p.dest_fraction(Some(250.0), Some(350.0), 90), [Some(0.5), Some(0.75)]);
+        p.rotation = 180;
+        assert_eq!(p.dest_fraction(Some(250.0), Some(350.0), 0), [Some(0.5), Some(0.75)]);
+        p.rotation = 270;
+        assert_eq!(p.dest_fraction(Some(250.0), Some(350.0), 0), [Some(0.25), Some(0.5)]);
+        assert_eq!(p.dest_fraction(Some(250.0), Some(350.0), 90), [Some(0.5), Some(0.25)]);
+        // A degenerate crop box never divides by zero.
+        let flat = PageInfo { crop: [0.0, 0.0, 0.0, 0.0], rotation: 0, ..p };
+        assert!(flat.dest_fraction(Some(5.0), Some(-5.0), 0).iter().all(|f| f.is_some_and(|f| (0.0..=1.0).contains(&f))));
     }
 
     #[test]
@@ -1426,6 +2237,21 @@ trailer << /Root 1 0 R >>
     fn dates_are_prettified() {
         assert_eq!(pretty_date("D:20260930104512-04'00'"), "2026-09-30 10:45");
         assert_eq!(pretty_date("yesterday"), "yesterday");
+    }
+
+    #[test]
+    fn jspdf_high_precision_mediabox_does_not_overflow_dimensions() {
+        let pdf = b"%PDF-1.3
+1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj
+2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj
+3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 3874.9606299212600788 5493.5433070866147318] >> endobj
+trailer << /Root 1 0 R >>
+%%EOF";
+        let info = inspect(std::sync::Arc::new(pdf.to_vec()), None).expect("opens");
+        assert_eq!(info.pages.len(), 1);
+        let p = &info.pages[0];
+        assert!((p.width - 3874.96).abs() < 0.1, "width expected ~3874.96, got {}", p.width);
+        assert!((p.height - 5493.54).abs() < 0.1, "height expected ~5493.54, got {}", p.height);
     }
 }
 

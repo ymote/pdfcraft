@@ -6,6 +6,7 @@ use pdfcraft_ui_egui::PdfCraftApp;
 fn harness() -> Harness<'static, PdfCraftApp> {
     let mut h = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).build_eframe(|_cc| {
         let mut app = PdfCraftApp::new();
+        app.set_option("language", "en").unwrap();
         app.open_bytes("form.pdf", None, include_bytes!("data/form.pdf").to_vec()).unwrap();
         app.set_option("left", "closed").unwrap();
         // The whole 300×400 pt page on screen.
@@ -148,6 +149,7 @@ fn date_fields_offer_a_calendar() {
 /// The value of `name` in a saved PDF, read back by opening it in a fresh app.
 fn saved_value(path: &std::path::Path, name: &str) -> Vec<String> {
     let mut app = PdfCraftApp::new();
+    app.set_option("language", "en").unwrap();
     app.open_bytes("saved.pdf", None, std::fs::read(path).unwrap()).unwrap();
     app.session.get(app.views[0].id).unwrap().form.iter().find(|f| f.name == name).unwrap().value.clone()
 }
@@ -177,6 +179,68 @@ fn saving_while_still_typing_in_a_field_saves_the_text() {
     let doc = h.state().session.get(h.state().views[0].id).unwrap();
     assert!(!doc.dirty, "and the document is saved, not left with an unsaved change");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn tabbing_back_to_the_same_field_then_saving_keeps_the_committed_value() {
+    // A form with one text field wraps Tab back to that field. Multiple widgets of one
+    // field share its value too: opening the next widget must see the accepted edit.
+    for (case, shared_widgets, backwards, same_frame) in [
+        ("single-forward", false, false, false),
+        ("single-backward", false, true, false),
+        ("shared-forward", true, false, false),
+        ("shared-backward", true, true, false),
+        ("same-frame", false, false, true),
+    ] {
+        let dir = scratch(case);
+        let out = dir.join("saved.pdf");
+        let bytes = if shared_widgets {
+            pdf_from_objects(&[
+                "<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [4 0 R] /DA (/Helv 0 Tf 0 g) /DR << /Font << /Helv 5 0 R >> >> >> >>",
+                "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 300 400] >>",
+                "<< /Type /Page /Parent 2 0 R /Annots [6 0 R 7 0 R] >>",
+                "<< /FT /Tx /T (qty) /V (4) /Kids [6 0 R 7 0 R] >>",
+                "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+                "<< /Type /Annot /Subtype /Widget /Parent 4 0 R /Rect [20 350 280 372] /P 3 0 R /F 4 >>",
+                "<< /Type /Annot /Subtype /Widget /Parent 4 0 R /Rect [20 250 280 272] /P 3 0 R /F 4 >>",
+            ])
+        } else {
+            validated_form()
+        };
+        let mut h = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).build_eframe(|_cc| {
+            let mut app = PdfCraftApp::new();
+            app.set_option("language", "en").unwrap();
+            app.open_bytes("tab.pdf", None, bytes).unwrap();
+            app.set_option("left", "closed").unwrap();
+            app.set_option("zoom", "150").unwrap();
+            app
+        });
+        h.run_steps(6);
+        click_field(&mut h, "qty", 0);
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        h.event(egui::Event::Text("42".into()));
+        h.run_steps(2);
+        h.state_mut().save_override = Some(out.to_string_lossy().into_owned());
+        let modifiers = if backwards { egui::Modifiers::SHIFT } else { egui::Modifiers::NONE };
+        if same_frame {
+            one_frame(&mut h, vec![key(egui::Key::Tab, modifiers), key(egui::Key::S, egui::Modifiers::COMMAND)]);
+        } else {
+            h.key_press_modifiers(modifiers, egui::Key::Tab);
+            h.run_steps(3);
+            h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::S);
+        }
+        h.run_steps(4);
+        assert_eq!(saved_value(&out, "qty"), ["42"], "{case}: saving cannot restore the old value");
+        assert_eq!(value(&h, "qty"), ["42"], "{case}");
+        // One typing action is one history entry, even after saving. Escape closes the
+        // untouched editor before undoing the document rather than the TextEdit buffer.
+        h.key_press(egui::Key::Escape);
+        h.state_mut().undo();
+        assert_eq!(value(&h, "qty"), ["4"], "{case}: a single undo restores the original");
+        h.state_mut().redo();
+        assert_eq!(value(&h, "qty"), ["42"], "{case}: redo restores the committed value");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[test]
@@ -282,13 +346,16 @@ fn exporting_form_data_while_typing_includes_the_text() {
 
 /// One text field, `qty`, whose validation script refuses values over 100.
 fn validated_form() -> Vec<u8> {
-    let objs = [
+    pdf_from_objects(&[
         "<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [4 0 R] /DA (/Helv 0 Tf 0 g) /DR << /Font << /Helv 5 0 R >> >> >> >>",
         "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 300 400] >>",
         "<< /Type /Page /Parent 2 0 R /Annots [4 0 R] >>",
         "<< /Type /Annot /Subtype /Widget /FT /Tx /T (qty) /V (4) /Rect [20 350 280 372] /P 3 0 R /F 4 /AA << /V << /S /JavaScript /JS (if (event.value > 100) { app.alert('At most 100'); event.rc = false; }) >> >> >>",
         "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
-    ];
+    ])
+}
+
+fn pdf_from_objects(objs: &[&str]) -> Vec<u8> {
     let mut out = b"%PDF-1.7\n".to_vec();
     let mut offsets = Vec::new();
     for (i, o) in objs.iter().enumerate() {
@@ -310,6 +377,7 @@ fn a_rejected_value_keeps_the_typing_and_stops_the_save() {
     let out = dir.join("saved.pdf");
     let mut h = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).build_eframe(|_cc| {
         let mut app = PdfCraftApp::new();
+        app.set_option("language", "en").unwrap();
         app.open_bytes("order.pdf", None, validated_form()).unwrap();
         app.set_option("left", "closed").unwrap();
         app.set_option("zoom", "150").unwrap();
@@ -352,10 +420,20 @@ fn a_save_shortcut_pressed_while_typing_saves_only_the_document_it_was_pressed_i
 
 #[test]
 fn a_value_refused_on_enter_keeps_save_in_the_same_frame_from_running() {
-    let dir = scratch("enter-refused");
+    refused_value_stops_save(egui::Key::Enter, "enter-refused");
+}
+
+#[test]
+fn a_value_refused_on_tab_keeps_save_in_the_same_frame_from_running() {
+    refused_value_stops_save(egui::Key::Tab, "tab-refused");
+}
+
+fn refused_value_stops_save(commit_key: egui::Key, case: &str) {
+    let dir = scratch(case);
     let out = dir.join("saved.pdf");
     let mut h = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).build_eframe(|_cc| {
         let mut app = PdfCraftApp::new();
+        app.set_option("language", "en").unwrap();
         app.open_bytes("order.pdf", None, validated_form()).unwrap();
         app.set_option("left", "closed").unwrap();
         app.set_option("zoom", "150").unwrap();
@@ -366,7 +444,7 @@ fn a_value_refused_on_enter_keeps_save_in_the_same_frame_from_running() {
     h.event(egui::Event::Text("500".into()));
     h.run_steps(2);
     h.state_mut().save_override = Some(out.to_string_lossy().into_owned());
-    one_frame(&mut h, vec![key(egui::Key::Enter, egui::Modifiers::NONE), key(egui::Key::S, egui::Modifiers::COMMAND)]);
+    one_frame(&mut h, vec![key(commit_key, egui::Modifiers::NONE), key(egui::Key::S, egui::Modifiers::COMMAND)]);
     h.run_steps(3);
     assert_eq!(value(&h, "qty"), ["4"]);
     assert!(!out.exists(), "nothing is saved right after the field refused its value");
@@ -396,4 +474,78 @@ fn flattening_while_typing_flattens_the_typed_text() {
         .map(|t| t.plain_text())
         .unwrap_or_default();
     assert!(text.contains("Flat Ada"), "into the page: {text:?}");
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+mod revert_tests {
+    use super::*;
+    use egui_kittest::kittest::Queryable;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct RevertDir(PathBuf);
+    impl RevertDir {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            for _ in 0..128 {
+                let path = std::env::temp_dir().join(format!("pdfcraft-revert-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+                match std::fs::create_dir(&path) {
+                    Ok(()) => return Self(path),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("creating Revert test directory: {error}"),
+                }
+            }
+            panic!("no unused Revert test directory after 128 attempts");
+        }
+    }
+    impl Drop for RevertDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn reverting_rejected_input_saves_the_original_field_and_appearance() {
+        let dir = RevertDir::new();
+        let path = dir.0.join("saved.pdf");
+        let mut h = harness();
+        assert!(h.state_mut().apply_edit(pdfcraft_engine::Edit::SetFieldValue {
+            name: "name".into(),
+            value: pdfcraft_engine::FieldValue::Text("Saved original".into()),
+        }));
+        h.state_mut().save_override = Some(path.to_string_lossy().into_owned());
+        assert!(h.state_mut().save_active(pdfcraft_ui_egui::SaveTarget::InPlace));
+        let saved = std::fs::read(&path).unwrap();
+        assert!(h.state_mut().apply_edit(pdfcraft_engine::Edit::SetFieldProps {
+            name: "name".into(),
+            props: Box::new(pdfcraft_engine::FieldProps {
+                validate: Some(pdfcraft_engine::form_scripts::Validate::Range { min: Some(0.0), max: Some(10.0) }),
+                ..Default::default()
+            }),
+        }));
+        h.run_steps(3);
+        click_field(&mut h, "name", 0);
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        h.event(egui::Event::Text("99".into()));
+        h.run_steps(2);
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::S);
+        h.run_steps(4);
+        assert_eq!(h.state().views[0].forms.focus.as_ref().unwrap().text, "99");
+        assert_eq!(std::fs::read(&path).unwrap(), saved, "rejection leaves the saved file untouched");
+        assert!(h.state_mut().execute("file.revert"));
+        h.run_steps(2);
+        h.get_all_by_label("Revert").last().expect("confirmation button").click();
+        h.run_steps(4);
+        assert!(h.state().views[0].forms.focus.is_none() && h.state().views[0].pending_edit.is_none());
+        assert_eq!(h.state().first_dirty(), None, "Revert discards rejected typing too");
+        assert_eq!(value(&h, "name"), ["Saved original"]);
+        assert!(h.state_mut().save_active(pdfcraft_ui_egui::SaveTarget::InPlace));
+        assert_eq!(saved_value(&path, "name"), ["Saved original"]);
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes, saved, "later Save cannot resurrect the discarded draft");
+        let mut renderer = pdfcraft_render::PageRenderer::new(std::sync::Arc::new(bytes), Default::default());
+        let output = renderer.render(pdfcraft_render::RenderRequest { page: 0, kind: pdfcraft_render::RequestKind::Text, ..Default::default() });
+        assert!(output.error.is_none(), "saved appearance is readable: {:?}", output.error);
+        assert!(output.text.unwrap().plain_text().contains("Saved original"), "saved AP still draws the original value");
+    }
 }

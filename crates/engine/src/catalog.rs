@@ -149,7 +149,7 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
             title: "Create from",
             items: &[
                 item("Single file", "file-input", "create.file", Ready),
-                item("Multiple files", "files", "create.multiple", Planned("M10")),
+                item("Multiple files", "files", "create.multiple", Ready),
                 item("Images", "image", "create.images", Ready),
                 item("Clipboard", "copy-plus", "create.clipboard", Ready),
                 item("Blank page", "file-plus-2", "create.blank", Ready),
@@ -250,6 +250,7 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
                 item("In this file", "scan-text", "ocr.recognize", Ready),
                 item("In multiple files", "files", "ocr.recognize_batch", Ready),
                 item("Enhance scanned file", "sparkles", "ocr.enhance", Planned("M10")),
+                item("Enhance camera image", "camera", "ocr.enhance_camera", Ready),
                 item("Correct recognized text", "text-select", "ocr.correct", Planned("M10")),
             ],
         }],

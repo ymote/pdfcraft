@@ -13,11 +13,16 @@
 //!
 //! Methods (JSON in, JSON out):
 //! - `ui.state`: open documents, active document, page, zoom, page errors, mode, panels, dialog,
-//!   notice.
-//! - `ui.inspect {query?, role?, limit?}`: widgets in tree order with `id` (a string), `role`, `label`,
-//!   `value`, `rect` (points), `enabled`, `toggled`, `selected`, `clickable`, `depth`.
+//!   notice and observed window dimensions in logical points.
+//! - `ui.inspect {query?, role?, focused?, limit?}`: widgets in tree order with `id` (a string), `role`, `label`,
+//!   `value`, `rect` (points), `enabled`, `toggled`, `selected`, `clickable`, `focusable`, `focused`, `depth`.
 //! - `ui.click {id}` | `{label}` | `{x, y, button?}`: click a widget (by its AccessKit action) or a
 //!   point (`button`: primary, secondary, or middle).
+//! - `ui.focus {id}` | `{label}`: focus one enabled widget through its AccessKit action.
+//! - `ui.resize {width, height}`: request a native window size (320–8192 logical points per dimension).
+//!   The window manager may constrain it; `ui.state.window` reports the observed result.
+//! - `ui.quit {}`: normal native exit, or `quitting: false, needs_confirmation: true` and the
+//!   existing save prompt when any document has unsaved edits or typing. No discard parameter.
 //! - `ui.move {x, y}`: move the pointer without pressing a button (e.g. latched autoscroll).
 //! - `ui.drag {from: [x, y], to: [x, y], steps?, modifiers?, button?}`: press, move and release (drawing
 //!   comments, selecting text, moving comments). `ui.state` reports `pages_on_screen` to aim at.
@@ -172,9 +177,11 @@ pub fn attach(ctx: &egui::Context) -> (Control, ControlClient) {
 pub(crate) trait Host {
     fn state(&self) -> Value;
     fn command(&mut self, id: &str) -> Reply;
+    fn dock(&mut self, reset: bool, params: &Value) -> Reply;
     fn commands(&self) -> Value;
     fn set(&mut self, key: &str, value: &str) -> Reply;
     fn open(&mut self, path: &str) -> Reply;
+    fn quit(&mut self, ctx: &egui::Context) -> bool;
 }
 
 impl Control {
@@ -265,8 +272,15 @@ impl Control {
     fn handle(&mut self, ctx: &egui::Context, host: &mut impl Host, method: &str, p: &Value) -> Handled {
         let str_param = |k: &str| p.get(k).and_then(Value::as_str).ok_or_else(|| format!("{method}: missing string parameter {k}"));
         let r: Result<Handled, String> = (|| match method {
-            "ui.state" => Ok(Handled::Now(Ok(host.state()))),
+            "ui.state" => {
+                let mut state = host.state();
+                let size = ctx.input(|i| i.viewport_rect().size());
+                state["window"] = json!({ "width": size.x, "height": size.y, "pixels_per_point": ctx.pixels_per_point() });
+                Ok(Handled::Now(Ok(state)))
+            }
             "ui.commands" => Ok(Handled::Now(Ok(host.commands()))),
+            "ui.dock" | "ui.dock.reset" => Ok(Handled::Now(host.dock(method == "ui.dock.reset", p))),
+            "ui.command" if str_param("id")? == "ui.dock" => Ok(Handled::Now(host.dock(false, p.get("params").unwrap_or(p)))),
             "ui.command" => Ok(Handled::Now(host.command(str_param("id")?))),
             "ui.set" => {
                 let value = match p.get("value") {
@@ -279,6 +293,32 @@ impl Control {
             "ui.open" => Ok(Handled::Now(host.open(str_param("path")?))),
             "ui.inspect" => Ok(Handled::Now(Ok(self.inspect(p)))),
             "ui.click" => self.click(p),
+            "ui.focus" => self.focus(p),
+            "ui.resize" => {
+                only_params(p, method, &["width", "height"])?;
+                let dimension = |key: &str| -> Result<f32, String> {
+                    p.get(key)
+                        .and_then(Value::as_f64)
+                        .filter(|n| n.is_finite() && (320.0..=8192.0).contains(n))
+                        .map(|n| n as f32)
+                        .ok_or_else(|| format!("ui.resize: {key} must be between 320 and 8192 logical points"))
+                };
+                let size = egui::vec2(dimension("width")?, dimension("height")?);
+                if cfg!(target_arch = "wasm32") {
+                    return Err("ui.resize needs a native window".into());
+                }
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+                ctx.request_repaint();
+                Ok(Handled::AfterFrames(2, json!({ "requested": [size.x, size.y] })))
+            }
+            "ui.quit" => {
+                only_params(p, method, &[])?;
+                if cfg!(target_arch = "wasm32") {
+                    return Err("ui.quit needs a native window".into());
+                }
+                let quitting = host.quit(ctx);
+                Ok(Handled::Now(Ok(json!({ "quitting": quitting, "needs_confirmation": !quitting }))))
+            }
             "ui.drag" => self.drag(p),
             "ui.move" => {
                 let point = |key: &str| -> Result<f32, String> {
@@ -312,7 +352,7 @@ impl Control {
                 Ok(Handled::Screenshot(region))
             }
             other => Err(format!(
-                "unknown method {other:?} (ui.state, ui.inspect, ui.click, ui.move, ui.drag, ui.type, ui.key, ui.command, ui.commands, ui.set, ui.open, ui.screenshot)"
+                "unknown method {other:?} (ui.state, ui.inspect, ui.click, ui.focus, ui.resize, ui.quit, ui.move, ui.drag, ui.type, ui.key, ui.command, ui.commands, ui.set, ui.open, ui.screenshot)"
             )),
         })();
         r.unwrap_or_else(|e| Handled::Now(Err(e)))
@@ -321,6 +361,7 @@ impl Control {
     fn inspect(&self, p: &Value) -> Value {
         let query = p.get("query").and_then(Value::as_str).map(str::to_lowercase);
         let role = p.get("role").and_then(Value::as_str).map(str::to_lowercase);
+        let focused = p.get("focused").and_then(Value::as_bool);
         let limit = p.get("limit").and_then(Value::as_u64).unwrap_or(500) as usize;
         let Ok(s) = self.shared.lock() else { return json!({ "widgets": [] }) };
         let mut out = Vec::new();
@@ -337,7 +378,8 @@ impl Control {
                     .to_lowercase();
             let role_ok = role.as_ref().is_none_or(|r| w["role"].as_str().is_some_and(|x| x.to_lowercase() == *r));
             let query_ok = query.as_ref().is_none_or(|q| text.contains(q.as_str()));
-            if role_ok && query_ok && id != s.root.unwrap_or(id) {
+            let focus_ok = focused.is_none_or(|want| (s.focus == Some(id)) == want);
+            if role_ok && query_ok && focus_ok && id != s.root.unwrap_or(id) {
                 total += 1;
                 if out.len() < limit {
                     out.push(w);
@@ -414,6 +456,38 @@ impl Control {
         let frames = self.inject(vec![vec![egui::Event::AccessKitActionRequest(action)]]);
         Ok(Handled::AfterFrames(frames, json!({ "clicked": id.0.to_string(), "label": label })))
     }
+
+    fn focus(&mut self, p: &Value) -> Result<Handled, String> {
+        only_params(p, "ui.focus", &["id", "label"])?;
+        let s = self.shared.lock().map_err(|_| "control state poisoned")?;
+        let id = match (p.get("id"), p.get("label")) {
+            (Some(id), None) => {
+                NodeId(id.as_u64().or_else(|| id.as_str().and_then(|s| s.parse().ok())).ok_or("ui.focus: id must be a widget id from ui.inspect")?)
+            }
+            (None, Some(Value::String(label))) => {
+                let matches: Vec<NodeId> = s
+                    .nodes
+                    .iter()
+                    .filter(|(_, n)| n.supports_action(Action::Focus) && !n.is_disabled() && n.label().is_some_and(|l| l.eq_ignore_ascii_case(label)))
+                    .map(|(id, _)| *id)
+                    .collect();
+                match matches.as_slice() {
+                    [one] => *one,
+                    [] => return Err(format!("ui.focus: no enabled focusable widget labelled {label:?}")),
+                    many => return Err(format!("ui.focus: {} widgets are labelled {label:?}; use a widget id", many.len())),
+                }
+            }
+            _ => return Err("ui.focus: pass exactly one widget id or label".into()),
+        };
+        let node = s.nodes.get(&id).ok_or_else(|| format!("ui.focus: no widget with id {} on screen (run ui.inspect again)", id.0))?;
+        if node.is_disabled() || !node.supports_action(Action::Focus) {
+            return Err(format!("ui.focus: widget {} is disabled or not focusable", id.0));
+        }
+        let action = accesskit::ActionRequest { action: Action::Focus, target_tree: accesskit::TreeId::ROOT, target_node: id, data: None };
+        drop(s);
+        let frames = self.inject(vec![vec![egui::Event::AccessKitActionRequest(action)]]);
+        Ok(Handled::AfterFrames(frames, json!({ "focus_requested": id.0.to_string() })))
+    }
 }
 
 enum Handled {
@@ -431,6 +505,7 @@ fn widget(id: NodeId, n: &accesskit::Node, depth: usize, focused: bool) -> Value
         "depth": depth,
         "enabled": !n.is_disabled(),
         "clickable": n.supports_action(Action::Click),
+        "focusable": n.supports_action(Action::Focus),
     });
     let mut more = serde_json::Map::new();
     let obj = &mut more;
@@ -459,6 +534,18 @@ fn widget(id: NodeId, n: &accesskit::Node, depth: usize, focused: bool) -> Value
         m.extend(more);
     }
     w
+}
+
+fn only_params(p: &Value, method: &str, allowed: &[&str]) -> Result<(), String> {
+    // The JSON-RPC transport represents omitted params as null.
+    if p.is_null() && allowed.is_empty() {
+        return Ok(());
+    }
+    let object = p.as_object().ok_or_else(|| format!("{method}: params must be an object"))?;
+    if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
+        return Err(format!("{method}: unknown parameter {key:?}"));
+    }
+    Ok(())
 }
 
 fn pointer_button(p: &Value, method: &str) -> Result<egui::PointerButton, String> {
@@ -533,6 +620,14 @@ fn screenshot_png(image: &egui::ColorImage, region: Option<egui::Rect>, ppp: f32
 }
 
 impl Host for crate::PdfCraftApp {
+    fn dock(&mut self, reset: bool, params: &Value) -> Reply {
+        crate::docking::command(self, reset, params)
+    }
+
+    fn quit(&mut self, ctx: &egui::Context) -> bool {
+        self.request_quit(ctx)
+    }
+
     fn state(&self) -> Value {
         let active = self.active.and_then(|i| self.views.get(i));
         let docs: Vec<Value> = self
@@ -545,6 +640,7 @@ impl Host for crate::PdfCraftApp {
             })
             .collect();
         json!({
+            "docking": self.docking,
             "documents": docs,
             "active": active.map(|v| json!({
                 "doc": v.id.0,
@@ -553,9 +649,11 @@ impl Host for crate::PdfCraftApp {
                 "fit": format!("{:?}", v.fit),
                 "layout": format!("{:?}", v.layout),
                 "organize": v.organize,
+                "grid_zoom": v.grid_zoom(),
                 // Pages picked in the organize grid or the Pages panel (empty: the current page).
                 "selected_pages": v.selected.iter().map(|p| p + 1).collect::<Vec<_>>(),
                 "auto_scrolling": v.auto_scrolling(),
+                "raster_memory": v.raster_memory(),
                 "viewport": [v.viewport_rect().min.x, v.viewport_rect().min.y, v.viewport_rect().max.x, v.viewport_rect().max.y],
                 "find_open": v.find.is_some(),
                 "page_errors": v.page_errors().iter().map(|(p, e)| json!({ "page": p + 1, "error": e })).collect::<Vec<_>>(),
@@ -564,11 +662,23 @@ impl Host for crate::PdfCraftApp {
                 "selected_comment": v.comments.selected.map(|(p, i)| json!({ "page": p + 1, "index": i + 1 })),
                 "comment_composer_open": v.comments.composer.is_some(),
             })),
+            // The Combine files tab: how its files show, and each grid thumbnail's state.
+            "combine": {
+                "showing": self.combine_showing(),
+                "view": self.combine_view.as_str(),
+                "zoom": self.combine_zoom,
+                "files": self.combine_draft.iter().map(|f| f.name.clone()).collect::<Vec<_>>(),
+                "selected": self.combine_selection(),
+                "thumbnails": self.combine_thumbnails().iter().map(|t| format!("{t:?}")).collect::<Vec<_>>(),
+                "expanded": self.combine_expanded().iter().filter_map(|i| self.combine_draft.get(*i).map(|f| f.name.clone())).collect::<Vec<_>>(),
+                "preview": self.combine_preview().map(|(file, page, render)| json!({ "file": file, "page": page + 1, "render": format!("{render:?}") })),
+            },
             "quick_tool": match self.quick_tool {
                 crate::QuickTool::Measure(t) => format!("measure-{}", t.name()),
                 crate::QuickTool::Select => "select".to_string(),
                 crate::QuickTool::Hand => "hand".to_string(),
                 crate::QuickTool::Crop => "crop".to_string(),
+                crate::QuickTool::EnhanceCamera => "enhance-camera".to_string(),
                 crate::QuickTool::Redact => "redact".to_string(),
                 crate::QuickTool::AddText => "add-text".to_string(),
                 crate::QuickTool::EditText => "edit-text".to_string(),
@@ -577,6 +687,7 @@ impl Host for crate::PdfCraftApp {
                 crate::QuickTool::SignArea { certify: true } => "certify".to_string(),
                 crate::QuickTool::MarqueeZoom => "marquee-zoom".to_string(),
                 crate::QuickTool::Snapshot => "snapshot".to_string(),
+                crate::QuickTool::ColumnSelect => "column-select".to_string(),
                 crate::QuickTool::Stamp(k) => format!("stamp-{}", k.name().trim_start_matches("PC").to_ascii_lowercase()),
                 crate::QuickTool::CustomStamp(i) => format!("custom-stamp-{i}"),
                 crate::QuickTool::Fill(f) => format!("fill-{}", f.command().trim_start_matches("sign.fill.")),
@@ -594,6 +705,7 @@ impl Host for crate::PdfCraftApp {
             "theme_preference": self.theme_preference,
             "language": self.language,
             "notice": self.toast.as_ref().map(|t| t.0.clone()),
+            "progress": self.progress_notice.as_ref().map(|p| json!({ "label": p.label, "fraction": p.fraction })),
             "password_prompt": self.password_prompt.is_some(),
             "close_prompt": self.close_request.is_some(),
         })
@@ -609,10 +721,11 @@ impl Host for crate::PdfCraftApp {
     }
 
     fn commands(&self) -> Value {
-        let list: Vec<Value> = pdfcraft_engine::commands::COMMANDS
+        let mut list: Vec<Value> = pdfcraft_engine::commands::COMMANDS
             .iter()
             .map(|c| json!({ "id": c.id, "label": c.label, "menu": c.menu, "enabled": self.command_enabled(c), "shortcut": c.shortcut.map(|s| s.label(cfg!(target_os = "macos"))) }))
             .collect();
+        list.push(json!({"id": "ui.dock", "label": "Arrange Panel", "enabled": true, "params": "action, or operation/panel; move: target/zone/before; float/moveFloating: rect; resizeSplit: path/size; setStackOpen: open; resizeStack: height"}));
         json!({ "commands": list })
     }
 

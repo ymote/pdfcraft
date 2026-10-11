@@ -106,7 +106,7 @@ pub const SIDEWAYS: &[(&str, &str)] = &[
 ];
 
 /// External crates that constitute a UI toolkit / windowing dependency (prefix match with `*`).
-pub const UI_CRATES: &[&str] = &["egui", "eframe", "winit", "egui_kittest", "egui_extras", "egui_dock", "egui_tiles", "rfd", "wgpu*"];
+pub const UI_CRATES: &[&str] = &["egui", "eframe", "winit", "egui_kittest", "craft-ui", "egui_extras", "egui_dock", "egui_tiles", "rfd", "wgpu*"];
 pub const UI_MIN_LAYER: u8 = 7;
 
 pub fn short_name(pkg: &str) -> &str {
@@ -202,11 +202,10 @@ pub fn check(crates: &[Crate]) -> Vec<Violation> {
                 }
                 match classify(&d.name) {
                     None => {}
-                    Some(Class::Testkit) => {
-                        if d.kind != DepKind::Dev && class != Class::Testkit {
-                            out.push(Violation::TestkitAsNormalDep { krate: c.name.clone(), dep: d.name.clone() });
-                        }
+                    Some(Class::Testkit) if d.kind != DepKind::Dev && class != Class::Testkit => {
+                        out.push(Violation::TestkitAsNormalDep { krate: c.name.clone(), dep: d.name.clone() });
                     }
+                    Some(Class::Testkit) => {}
                     Some(dc) => {
                         let to = dc.layer().unwrap_or(u8::MAX);
                         let ok = to < layer || (to == layer && sideways_allowed(&c.name, &d.name));
@@ -306,11 +305,12 @@ mod tests {
 
     #[test]
     fn ui_crates_below_l7_flagged() {
-        for dep in ["egui", "eframe", "winit", "rfd", "wgpu", "wgpu-core", "egui_dock"] {
+        for dep in ["egui", "eframe", "winit", "rfd", "wgpu", "wgpu-core", "egui_dock", "craft-ui"] {
             let v = check(&[c("pdfcraft-engine", &[(dep, Normal, false)])]);
             assert!(matches!(v[..], [Violation::UiBelowL7 { layer: 6, .. }]), "{dep}");
         }
         assert!(check(&[c("pdfcraft-platform", &[("winit", Normal, false)])]).is_empty());
+        assert!(check(&[c("pdfcraft-ui-egui", &[("craft-ui", Normal, false)])]).is_empty());
     }
 
     #[test]
