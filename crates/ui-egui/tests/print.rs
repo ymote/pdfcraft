@@ -7,6 +7,7 @@ use pdfcraft_ui_egui::{Dialog, PdfCraftApp};
 fn harness() -> Harness<'static, PdfCraftApp> {
     let mut h = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).build_eframe(|_cc| {
         let mut app = PdfCraftApp::new();
+        app.set_option("language", "en").unwrap();
         app.open_bytes("form.pdf", None, include_bytes!("data/form.pdf").to_vec()).unwrap();
         app
     });
@@ -150,4 +151,95 @@ fn a_failed_save_as_pdf_keeps_the_dialog_open() {
     assert_eq!(h.state().dialog, Some(Dialog::Print), "the dialog stays open, with its settings");
     let toast = h.state().toast.as_ref().map(|(m, _)| m.clone()).unwrap_or_default();
     assert!(toast.contains("Could not save"), "the user is told why: {toast:?}");
+}
+
+/// Properties… shows the printer driver's own options (CUPS) and sends only those changed.
+#[test]
+fn print_dialog_shows_the_printer_driver_options() {
+    use pdfcraft_engine::print::spool;
+    let mut h = harness();
+    assert!(h.state_mut().execute("print.dialog"));
+    h.run_steps(3);
+    h.state_mut().print_draft.printer = None;
+    h.run_steps(1);
+    assert!(h.query_by(|n| n.label().as_deref() == Some("Properties…") && n.is_disabled()).is_some(), "Save as PDF has no driver");
+    let tray = spool::PrinterOption {
+        key: "InputSlot".into(),
+        label: "Paper tray".into(),
+        group: "Media".into(),
+        choices: vec![("AutoSelect".into(), "Auto tray select".into()), ("Tray2".into(), "Tray 2".into())],
+        default: "AutoSelect".into(),
+    };
+    {
+        let d = &mut h.state_mut().print_draft;
+        d.printer = Some("Test_Queue".into());
+        d.driver_options = Some(("Test_Queue".into(), vec![tray]));
+        d.driver_choices.insert("InputSlot".into(), "Tray2".into());
+        d.show_driver_options = true;
+    }
+    h.run_steps(2);
+    h.get_by_label("Printer properties");
+    h.get_by_label("Media");
+    h.get_by_label("Paper tray");
+    assert_eq!(h.state().print_draft.job("form.pdf").options, [("InputSlot".to_string(), "Tray2".to_string())]);
+    h.get_by_label("Reset to printer defaults").click();
+    h.run_steps(2);
+    assert!(h.state().print_draft.job("form.pdf").options.is_empty(), "defaults are not sent");
+    // Options read for another printer never go with this one's job.
+    h.state_mut().print_draft.driver_choices.insert("InputSlot".into(), "Tray2".into());
+    h.state_mut().print_draft.printer = Some("Other_Queue".into());
+    assert!(h.state().print_draft.job("form.pdf").options.is_empty());
+}
+
+/// The desktop app lists printers in the background (PowerShell on Windows takes a second or
+/// more): the dialog opens at once, then preselects the default when the list arrives — unless
+/// the user has already picked a printer.
+#[test]
+fn printers_listed_in_the_background_preselect_the_default_unless_one_was_picked() {
+    use pdfcraft_engine::print::spool::Printer;
+    use std::sync::{Arc, Mutex};
+    let mut h = harness();
+    // The source waits until the test lets it answer, so the dialog is seen while it looks.
+    let gate = Arc::new(Mutex::new(()));
+    let hold = gate.lock().unwrap();
+    let wait = gate.clone();
+    h.state_mut().printer_source = Some(Arc::new(move || {
+        let _open = wait.lock();
+        vec![Printer { name: "Office".into(), default: false }, Printer { name: "Front Desk".into(), default: true }]
+    }));
+    assert!(h.state_mut().execute("print.dialog"));
+    h.run_steps(2);
+    assert_eq!(h.state().dialog, Some(Dialog::Print), "the dialog doesn't wait for the printers");
+    assert!(h.state().print_draft.printers_loading);
+    assert_eq!(h.state().print_draft.printer, None);
+    drop(hold);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while h.state().print_draft.printers_loading && std::time::Instant::now() < deadline {
+        h.run_steps(1);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(!h.state().print_draft.printers_loading);
+    assert_eq!(h.state().print_draft.printers.len(), 2);
+    assert_eq!(h.state().print_draft.printer.as_deref(), Some("Front Desk"));
+
+    // Opened again: last time's list shows at once; a choice made before the fresh list
+    // arrives is kept.
+    h.state_mut().dialog = None;
+    let hold = gate.lock().unwrap();
+    assert!(h.state_mut().execute("print.dialog"));
+    h.run_steps(2);
+    assert_eq!(h.state().print_draft.printers.len(), 2, "the last list shows while looking");
+    {
+        let d = &mut h.state_mut().print_draft;
+        d.printer = None;
+        d.printer_picked = true;
+    }
+    drop(hold);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while h.state().print_draft.printers_loading && std::time::Instant::now() < deadline {
+        h.run_steps(1);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(!h.state().print_draft.printers_loading);
+    assert_eq!(h.state().print_draft.printer, None, "Save as PDF, as picked");
 }

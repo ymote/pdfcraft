@@ -181,6 +181,13 @@ impl Copier<'_> {
     }
 }
 
+/// Copy `o` from `src` into `dst`, reusing the copies listed in `map` (source → destination), so
+/// an object the copied pages already brought along (an ICC profile) is not stored twice.
+pub(crate) fn copy_object(dst: &mut Document, src: &Document, o: &Object, map: HashMap<ObjRef, ObjRef>) -> Object {
+    let mut c = Copier { src, map, pages: HashMap::new(), annots: Vec::new(), fields: Vec::new(), ocgs: Vec::new() };
+    c.copy_value(dst, o, None)
+}
+
 /// Copy pages `src_pages` (0-based, in the given order) of `src` into `dst`, inserting them at
 /// position `at`. Returns the new page references in order.
 ///
@@ -188,19 +195,24 @@ impl Copier<'_> {
 /// shared rather than stored twice (see `dedupe`).
 pub fn import_pages(dst: &mut Document, src: &Document, src_pages: &[usize], at: usize) -> Result<Vec<ObjRef>, OrganizeError> {
     let first_new = dst.object_numbers().last().map_or(1, |n| n + 1);
-    let pages = import_pages_mapped(dst, src, src_pages, at)?.0;
+    let pages = import_pages_mapped(dst, src, src_pages, at)?.pages;
     let created: Vec<ObjRef> = dst.object_numbers().into_iter().filter(|n| *n >= first_new).map(|n| ObjRef::new(n, dst.generation(n))).collect();
     crate::dedupe::dedupe_resources(dst, &created, true);
     Ok(pages)
 }
 
-/// `import_pages`, also returning the source-page → destination-page map.
-fn import_pages_mapped(
-    dst: &mut Document,
-    src: &Document,
-    src_pages: &[usize],
-    at: usize,
-) -> Result<(Vec<ObjRef>, HashMap<ObjRef, ObjRef>), OrganizeError> {
+/// What `import_pages_mapped` copied.
+struct Imported {
+    /// The new pages, in order.
+    pages: Vec<ObjRef>,
+    /// Source page → destination page.
+    page_map: HashMap<ObjRef, ObjRef>,
+    /// Every source object copied → its copy.
+    objects: HashMap<ObjRef, ObjRef>,
+}
+
+/// `import_pages`, also returning what was copied from where.
+fn import_pages_mapped(dst: &mut Document, src: &Document, src_pages: &[usize], at: usize) -> Result<Imported, OrganizeError> {
     let source = walk(src)?;
     if let Some(bad) = src_pages.iter().find(|i| **i >= source.len()) {
         return Err(OrganizeError::NoSuchPage(*bad));
@@ -225,8 +237,19 @@ fn import_pages_mapped(
     let mut new_pages = Vec::new();
     let mut done: HashMap<ObjRef, ObjRef> = HashMap::new();
     for (page, new, inherited) in targets {
-        // A page listed twice: make a second, independent page object sharing resources.
-        let new = if done.contains_key(&page) { dst.add(Object::Null) } else { new };
+        // A page listed twice: make a second, independent page object sharing resources, and
+        // with copies of its own annotations (an annotation belongs to one page: its `/P`, its
+        // popup, a widget's place). Destinations still map to the pages copied.
+        let repeat = done.contains_key(&page);
+        let new = if repeat { dst.add(Object::Null) } else { new };
+        let mut own = repeat.then(|| Copier {
+            src,
+            map: HashMap::new(),
+            pages: copier.pages.clone(),
+            annots: Vec::new(),
+            fields: Vec::new(),
+            ocgs: Vec::new(),
+        });
         let src_dict = src.get(page).as_dict().cloned().unwrap_or_default();
         let mut d = Dict::new();
         for (k, v) in src_dict.iter() {
@@ -237,13 +260,48 @@ fn import_pages_mapped(
                 let list = src.resolve(v).as_array().cloned().unwrap_or_default();
                 let mut out = Vec::new();
                 for a in list {
+                    // On a repeated page a form field's widget becomes one more widget of the
+                    // same field (copied already with the page's first copy): one field, one
+                    // value, shown on both pages. Copying the field again would make two fields
+                    // of one name, filled in separately.
+                    let resolved = src.resolve(&a);
+                    let field = resolved.as_dict().filter(|d| d.name(b"Subtype") == Some(b"Widget")).and_then(|d| d.reference(b"Parent"));
+                    if repeat
+                        && let Some(parent) = field
+                        && let Some(copied) = copier.map.get(&parent).copied()
+                    {
+                        let r = dst.add(Object::Null);
+                        let c = copier.copy_value(dst, &resolved, Some(r));
+                        dst.set(r, c);
+                        // `/Kids` may be an array object of its own: add to it there, so the
+                        // field keeps its other widgets.
+                        match dst.get(copied).as_dict().and_then(|f| f.get(b"Kids").cloned()) {
+                            Some(Object::Ref(list)) => {
+                                let mut kids = dst.get(list).as_array().cloned().unwrap_or_default();
+                                kids.push(Object::Ref(r));
+                                dst.set(list, Object::Array(kids));
+                            }
+                            _ => dst.update_dict(copied, |f| {
+                                let mut kids = f.get(b"Kids").and_then(|k| k.as_array()).cloned().unwrap_or_default();
+                                kids.push(Object::Ref(r));
+                                f.set(b"Kids".to_vec(), Object::Array(kids));
+                            })?,
+                        }
+                        annot_pages.insert(r, new);
+                        out.push(Object::Ref(r));
+                        continue;
+                    }
+                    // A widget that is its own field (no parent to hang a second widget on) stays
+                    // the one object, shown on both pages, so the field stays one.
+                    let own_field = resolved.as_dict().is_some_and(|d| d.name(b"Subtype") == Some(b"Widget") && !d.contains(b"Parent"));
+                    let annots = if own_field { &mut copier } else { own.as_mut().unwrap_or(&mut copier) };
                     // Direct (inline) annotation dictionaries become indirect objects, so every
                     // copied annotation can be fixed up the same way.
                     let r = match a {
-                        Object::Ref(r) => copier.copy_ref(dst, r),
+                        Object::Ref(r) => annots.copy_ref(dst, r),
                         Object::Dict(_) => {
                             let r = dst.add(Object::Null);
-                            let c = copier.copy_value(dst, &a, Some(r));
+                            let c = annots.copy_value(dst, &a, Some(r));
                             dst.set(r, c);
                             r
                         }
@@ -268,6 +326,12 @@ fn import_pages_mapped(
         d.set(b"Type".to_vec(), Object::name("Page"));
         d.set(b"Parent".to_vec(), Object::Ref(root));
         dst.set(new, Object::Dict(d));
+        // The repeat's own annotations are fixed up, its fields and layers registered, with the rest.
+        if let Some(own) = own {
+            copier.annots.extend(own.annots);
+            copier.fields.extend(own.fields);
+            copier.ocgs.extend(own.ocgs);
+        }
         done.insert(page, new);
         new_pages.push(new);
     }
@@ -278,7 +342,7 @@ fn import_pages_mapped(
     let inserted: Vec<(ObjRef, Dict)> = new_pages.iter().map(|r| (*r, Dict::new())).collect();
     existing.splice(at..at, inserted);
     rebuild(dst, &existing)?;
-    Ok((new_pages, copier.pages))
+    Ok(Imported { pages: new_pages, page_map: copier.pages, objects: copier.map })
 }
 
 /// Look up a named destination in the source (`/Dests` dictionary or `/Names /Dests` tree).
@@ -410,16 +474,19 @@ fn register_fields(dst: &mut Document, fields: &[ObjRef]) -> Result<(), Organize
 }
 
 /// A new document containing copies of `pages` from `src` (Extract Pages / Split).
-/// Document information (title, author…) is carried over.
+/// Document information (title, author…) is carried over, and so is the print standard the
+/// source declares (PDF/X: its output intents and identification, #263).
 pub fn extract_pages(src: &Document, pages: &[usize]) -> Result<Document, OrganizeError> {
     let mut out = Document::new_empty();
     // One source: nothing to deduplicate.
-    import_pages_mapped(&mut out, src, pages, 0)?;
+    let imported = import_pages_mapped(&mut out, src, pages, 0)?;
     for key in crate::INFO_KEYS {
         if let Some(v) = crate::info(src, key) {
             crate::set_info(&mut out, key, &v)?;
         }
     }
+    // After the title: the XMP packet repeats it.
+    crate::pdfx::carry(&mut out, src, &crate::pdfx::PrintStandard::of(src), imported.objects)?;
     // The pages share their source's resource dictionary, so the part would otherwise carry every
     // XObject the source lists — images and all (#204). Keep only what these pages draw.
     crate::prune::prune_unused_xobjects(&mut out)?;
@@ -463,7 +530,8 @@ pub fn split(src: &Document, by: &SplitBy) -> Result<Vec<Document>, OrganizeErro
 /// Combine whole documents, in order, into a new document. Each source gets a top-level
 /// bookmark (its `title`) pointing to its first page, like Acrobat's Combine Files.
 /// The source's own bookmarks are nested (collapsed) under its entry, and its document-level
-/// attachments are carried over.
+/// attachments are carried over. When every source declares the same print standard (PDF/X
+/// with the same output intent), so does the result.
 pub fn combine(sources: &[(&str, &Document)]) -> Result<Document, OrganizeError> {
     let all: Vec<(&str, &Document, Option<&[usize]>)> = sources.iter().map(|(t, d)| (*t, *d, None)).collect();
     combine_selected(&all)
@@ -475,6 +543,10 @@ pub fn combine_selected(sources: &[(&str, &Document, Option<&[usize]>)]) -> Resu
     let mut out = Document::new_empty();
     let mut marks = Vec::new();
     let mut attachments = Vec::new();
+    // The first source's print standard, and what its pages brought along; it carries over
+    // only when every source declares the same one.
+    let mut standard: Option<(crate::pdfx::PrintStandard, &Document, HashMap<ObjRef, ObjRef>)> = None;
+    let mut agreed = true;
     for (title, src, chosen) in sources {
         let n = crate::page_count(src)?;
         let pages: Vec<usize> = match chosen {
@@ -487,13 +559,100 @@ pub fn combine_selected(sources: &[(&str, &Document, Option<&[usize]>)]) -> Resu
             None => (0..n).collect(),
         };
         let at = crate::page_count(&out)?;
-        let (new, page_map) = import_pages_mapped(&mut out, src, &pages, at)?;
-        if let Some(first) = new.first() {
-            marks.push((title.to_string(), *first, *src, page_map));
+        let imported = import_pages_mapped(&mut out, src, &pages, at)?;
+        if let Some(first) = imported.pages.first() {
+            marks.push((title.to_string(), *first, *src, imported.page_map));
         }
         collect_attachments(&mut out, src, &mut attachments);
+        let declared = crate::pdfx::PrintStandard::of(src);
+        match &standard {
+            None => standard = Some((declared, *src, imported.objects)),
+            Some((first, _, _)) => agreed &= first.same_as(&declared),
+        }
+    }
+    if let Some((declared, src, objects)) = standard.filter(|_| agreed) {
+        crate::pdfx::carry(&mut out, src, &declared, objects)?;
     }
     // Sources often share fonts, images and profiles (or are the same file): store them once.
+    let all: Vec<ObjRef> = out.object_numbers().into_iter().map(|n| ObjRef::new(n, out.generation(n))).collect();
+    crate::dedupe::dedupe_resources(&mut out, &all, false);
+    add_outline(&mut out, &marks)?;
+    set_attachments(&mut out, attachments)?;
+    Ok(out)
+}
+
+/// One run of pages for [`combine_grouped`]: the file it comes from (`group`: runs with the same
+/// group are one file split around, and give the same document), its title, the document, and
+/// its pages (0-based, in that order; `None` for all of them).
+pub type Run<'a> = (usize, &'a str, &'a Document, Option<&'a [usize]>);
+
+/// Combine Files where a file's pages may be split into several runs with other files' pages
+/// between them. Each file (group) is copied once, all its pages together, then the pages are put
+/// in the runs' order: its links between its own pages, its form fields and its attachments stay
+/// whole, and it gets one top-level bookmark (the title of its first run) at its first page, its
+/// own bookmarks nested. Otherwise as [`combine_selected`] (print standard, shared resources).
+pub fn combine_grouped(runs: &[Run<'_>]) -> Result<Document, OrganizeError> {
+    // Each file's pages, in the order its runs list them, and each run's place in that list.
+    struct File<'a> {
+        title: &'a str,
+        src: &'a Document,
+        pages: Vec<usize>,
+    }
+    let mut files: Vec<(usize, File<'_>)> = Vec::new();
+    let mut slices: Vec<(usize, usize, usize)> = Vec::with_capacity(runs.len());
+    for (group, title, src, chosen) in runs {
+        let at = match files.iter().position(|(g, _)| g == group) {
+            Some(at) => at,
+            None => {
+                files.push((*group, File { title, src, pages: Vec::new() }));
+                files.len() - 1
+            }
+        };
+        let Some((_, file)) = files.get_mut(at) else { continue };
+        let n = crate::page_count(file.src)?;
+        let pages: Vec<usize> = match chosen {
+            Some(p) => {
+                if let Some(bad) = p.iter().find(|i| **i >= n) {
+                    return Err(OrganizeError::NoSuchPage(*bad));
+                }
+                p.to_vec()
+            }
+            None => (0..n).collect(),
+        };
+        slices.push((at, file.pages.len(), pages.len()));
+        file.pages.extend(pages);
+    }
+    let mut out = Document::new_empty();
+    let mut marks = Vec::new();
+    let mut attachments = Vec::new();
+    let mut copies: Vec<Vec<ObjRef>> = Vec::with_capacity(files.len());
+    let mut standard: Option<(crate::pdfx::PrintStandard, &Document, HashMap<ObjRef, ObjRef>)> = None;
+    let mut agreed = true;
+    for (_, file) in &files {
+        let at = crate::page_count(&out)?;
+        let imported = import_pages_mapped(&mut out, file.src, &file.pages, at)?;
+        copies.push(imported.pages.clone());
+        if let Some(first) = imported.pages.first() {
+            marks.push((file.title.to_string(), *first, file.src, imported.page_map));
+        }
+        collect_attachments(&mut out, file.src, &mut attachments);
+        let declared = crate::pdfx::PrintStandard::of(file.src);
+        match &standard {
+            None => standard = Some((declared, file.src, imported.objects)),
+            Some((first, _, _)) => agreed &= first.same_as(&declared),
+        }
+    }
+    // The pages in the runs' order. A file's first run comes before its others, and its pages
+    // were copied in run order, so its bookmark (its first copied page) is its first page shown.
+    let mut order: Vec<(ObjRef, Dict)> = Vec::new();
+    for (file, start, len) in slices {
+        let run = copies.get(file).and_then(|c| c.get(start..start.saturating_add(len))).unwrap_or_default();
+        order.extend(run.iter().map(|r| (*r, Dict::new())));
+    }
+    rebuild(&mut out, &order)?;
+    if let Some((declared, src, objects)) = standard.filter(|_| agreed) {
+        crate::pdfx::carry(&mut out, src, &declared, objects)?;
+    }
     let all: Vec<ObjRef> = out.object_numbers().into_iter().map(|n| ObjRef::new(n, out.generation(n))).collect();
     crate::dedupe::dedupe_resources(&mut out, &all, false);
     add_outline(&mut out, &marks)?;

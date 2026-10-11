@@ -17,6 +17,7 @@ trailer << /Root 1 0 R >>
 fn harness() -> Harness<'static, PdfCraftApp> {
     let mut h = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).build_eframe(|_cc| {
         let mut app = PdfCraftApp::new();
+        app.set_option("language", "en").unwrap();
         app.open_bytes("doc.pdf", None, FIXTURE.to_vec()).unwrap();
         app
     });
@@ -63,6 +64,7 @@ fn watermark_and_background_dialogs() {
     h.state_mut().execute("edit.watermark");
     h.run_steps(2);
     assert!(h.query_by(|n| n.label().as_deref() == Some("OK") && n.is_disabled()).is_some(), "OK waits for text");
+    h.get_by_label("Offset from centre");
     h.state_mut().marks_draft.wm.text = "DRAFT".into();
     h.run_steps(2);
     h.get_by_label("OK").click();

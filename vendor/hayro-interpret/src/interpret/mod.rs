@@ -5,7 +5,7 @@ use crate::convert::{convert_line_cap, convert_line_join};
 use crate::device::Device;
 use crate::font::{Font, FontData, FontQuery, StandardFont};
 use crate::interpret::path::{
-    close_path, fill_path, fill_path_impl, fill_stroke_path, stroke_path,
+    apply_pending_clip, close_path, fill_path, fill_path_impl, fill_stroke_path, stroke_path,
 };
 use crate::interpret::state::{TextStateFont, handle_gs};
 use crate::interpret::text::TextRenderingMode;
@@ -21,10 +21,12 @@ use hayro_syntax::object::dict::keys::{
     ANNOTS, AP, AS, C, CA, F, MCID, N, OC, QUADPOINTS, RECT, SUBTYPE,
 };
 use hayro_syntax::object::{Array, Dict, Object, Rect, Stream, dict_or_stream};
-use hayro_syntax::page::{Page, Resources};
+use hayro_syntax::page::{ContentReader, Page, Resources};
+use hayro_syntax::MAX_DECODED_STREAM;
 use kurbo::{Affine, BezPath, Point, Shape};
 use smallvec::smallvec;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub(crate) mod path;
 pub(crate) mod state;
@@ -109,6 +111,10 @@ pub struct InterpreterSettings {
     /// PdfCraft patch: viewer overrides for optional content groups (object number, generation,
     /// visible), applied on top of the document's default configuration (Layers panel toggles).
     pub ocg_overrides: Arc<Vec<(i32, i32, bool)>>,
+    /// PdfCraft patch: once this is `true`, interpretation stops before the next content
+    /// operator. What was drawn is then incomplete, so only set it when the output will be
+    /// thrown away (a viewer's render whose result nobody can receive any more).
+    pub cancelled: Option<Arc<AtomicBool>>,
 }
 
 impl Default for InterpreterSettings {
@@ -129,6 +135,7 @@ impl Default for InterpreterSettings {
             render_annotations: true,
             hide_comments: false,
             ocg_overrides: Arc::new(Vec::new()),
+            cancelled: None,
         }
     }
 }
@@ -142,6 +149,8 @@ pub enum InterpreterWarning {
     UnsupportedFont,
     /// An image failed to decode.
     ImageDecodeFailure,
+    /// PdfCraft patch (18): a page content stream was skipped after exhausting its safety budget.
+    ContentTruncated,
 }
 
 /// interpret the contents of the page and render them into the device.
@@ -151,7 +160,11 @@ pub fn interpret_page<'a>(
     device: &mut impl Device<'a>,
 ) {
     let resources = page.resources();
-    interpret(page.typed_operations(), resources, context, device);
+    let mut content = page.content_reader();
+    // PdfCraft patch: the page's own contents count against its content budget too, where they
+    // are decoded whole. Streamed content is only ever held a window at a time.
+    crate::context::charge_content(content.materialized_len());
+    interpret_content(&mut content, resources, context, device);
 
     if context.settings.render_annotations
         && let Some(annot_arr) = page.raw().get::<Array<'_>>(ANNOTS)
@@ -313,18 +326,20 @@ fn draw_highlight_without_appearance<'a>(
     context.restore_state(device);
 }
 
-/// Interpret the instructions from `ops` and render them into the device.
-pub fn interpret<'a>(
-    mut ops: TypedIter<'_>,
+/// Interprets the instructions that `ops` yields, until they run out or the caller cancels. It runs
+/// once per window of a content stream, between one `save_state` and its restore (see
+/// `interpret_content`).
+fn interpret_window<'a>(
+    ops: &mut TypedIter<'_>,
     resources: &Resources<'a>,
     context: &mut Context<'a>,
     device: &mut impl Device<'a>,
 ) {
-    let num_states = context.num_states();
-
-    context.save_state();
-
     while let Some(op) = ops.next() {
+        // PdfCraft patch: stop when the caller cancelled (see `InterpreterSettings::cancelled`).
+        if context.settings.cancelled.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
+            break;
+        }
         match op {
             TypedInstruction::SaveState(_) => context.save_state(),
             TypedInstruction::StrokeColorDeviceRgb(s) => {
@@ -479,15 +494,7 @@ pub fn interpret<'a>(
                 stroke_path(context, device);
             }
             TypedInstruction::EndPath(_) => {
-                if let Some(clip) = *context.clip()
-                    && !context.path().elements().is_empty()
-                {
-                    let clip_path = context.get().ctm * context.path().clone();
-                    context.push_clip_path(clip_path, clip, device);
-
-                    *(context.clip_mut()) = None;
-                }
-
+                apply_pending_clip(context, device);
                 context.path_mut().truncate(0);
             }
             TypedInstruction::NonStrokeColor(c) => {
@@ -836,8 +843,84 @@ pub fn interpret<'a>(
             }
         }
     }
+}
+
+/// Interpret the instructions from `ops` and render them into the device.
+pub fn interpret<'a>(
+    mut ops: TypedIter<'_>,
+    resources: &Resources<'a>,
+    context: &mut Context<'a>,
+    device: &mut impl Device<'a>,
+) {
+    let num_states = context.num_states();
+
+    context.save_state();
+
+    interpret_window(&mut ops, resources, context, device);
 
     while context.num_states() > num_states {
         context.restore_state(device);
+    }
+    // PdfCraft patch (18): say that content was skipped, so a truncated page isn't a clean render.
+    if crate::context::content_was_truncated() {
+        (context.settings.warning_sink)(InterpreterWarning::ContentTruncated);
+    }
+}
+
+/// PdfCraft patch: the bytes of a window of page content. A window grows only while an instruction
+/// at its end is incomplete.
+const CONTENT_WINDOW: usize = 64 << 10;
+
+/// PdfCraft patch: interprets the content of a page a window at a time, so the decoded content is
+/// never all in memory (see `ContentReader`). A window ends at an instruction that is not complete
+/// yet: its bytes are kept, and the next window starts with them.
+fn interpret_content<'a>(
+    content: &mut ContentReader<'_>,
+    resources: &Resources<'a>,
+    context: &mut Context<'a>,
+    device: &mut impl Device<'a>,
+) {
+    let num_states = context.num_states();
+
+    context.save_state();
+
+    let mut window = Vec::with_capacity(CONTENT_WINDOW);
+    let mut exhausted = false;
+    let mut cut = false;
+    loop {
+        let (committed, needs_more) = {
+            let mut ops = TypedIter::new_window(&window, exhausted);
+            interpret_window(&mut ops, resources, context, device);
+            (ops.committed(), ops.needs_more())
+        };
+        window.drain(..committed);
+
+        let cancelled = context
+            .settings
+            .cancelled
+            .as_ref()
+            .is_some_and(|c| c.load(Ordering::Relaxed));
+        if !needs_more || cancelled || exhausted {
+            break;
+        }
+        // A window that is still incomplete at its end waits for more of the stream. It doubles
+        // while it waits, so one long instruction costs time in proportion to its length, and it
+        // stops growing at `MAX_DECODED_STREAM`, the most any one stream may decode to.
+        if window.len() >= MAX_DECODED_STREAM {
+            cut = true;
+            break;
+        }
+        let want = window.len().max(CONTENT_WINDOW);
+        if content.read_into(&mut window, want) == 0 {
+            exhausted = true;
+        }
+    }
+
+    while context.num_states() > num_states {
+        context.restore_state(device);
+    }
+    // PdfCraft patch (18): say that content was skipped, so a truncated page isn't a clean render.
+    if cut || content.truncated() || crate::context::content_was_truncated() {
+        (context.settings.warning_sink)(InterpreterWarning::ContentTruncated);
     }
 }
