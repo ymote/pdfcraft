@@ -1801,6 +1801,115 @@ mod tests {
         assert!(info.warnings[0].contains("physical page numbers"), "{:?}", info.warnings);
     }
 
+    // The hostile page-label files from ymote/pdfcraft's 221ffad0, kept as regressions on #480's
+    // bounds. They are read from bytes, through `inspect`, end to end.
+
+    /// A PDF of `pages` blank pages whose catalog's `/PageLabels` is `labels`, with `extra`
+    /// objects, numbered from 10, for the label tree to refer to.
+    fn with_labels(pages: usize, labels: &str, extra: &[&str]) -> Vec<u8> {
+        let kids: Vec<String> = (0..pages).map(|i| format!("{} 0 R", 100 + i)).collect();
+        let mut pdf = format!(
+            "%PDF-1.7\n1 0 obj << /Type /Catalog /Pages 2 0 R /PageLabels {labels} >> endobj\n2 0 obj << /Type /Pages /Kids [{}] /Count {pages} >> endobj\n",
+            kids.join(" ")
+        );
+        for (i, body) in extra.iter().enumerate() {
+            pdf.push_str(&format!("{} 0 obj {body} endobj\n", 10 + i));
+        }
+        for i in 0..pages {
+            pdf.push_str(&format!("{} 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >> endobj\n", 100 + i));
+        }
+        pdf.push_str("trailer << /Root 1 0 R >>\n%%EOF");
+        pdf.into_bytes()
+    }
+
+    fn labels_of(info: &DocInfo) -> Vec<&str> {
+        info.pages.iter().map(|p| p.label.as_str()).collect()
+    }
+
+    /// `page_labels` over `pages` pages (labelled 1, 2, 3…) of `pdf`'s `/PageLabels`.
+    fn labels_on(pdf: &[u8], pages: usize) -> (Vec<String>, Result<Vec<String>, &'static str>) {
+        let doc = Document::load_mem(pdf).expect("loads");
+        let mut info: Vec<PageInfo> = (0..pages)
+            .map(|i| PageInfo { width: 200.0, height: 200.0, label: (i + 1).to_string(), crop: [0.0, 0.0, 200.0, 200.0], rotation: 0 })
+            .collect();
+        let result = Inspector::new(&doc).page_labels(doc.catalog().expect("a catalog"), &mut info);
+        (info.into_iter().map(|p| p.label).collect(), result)
+    }
+
+    /// About 300 bytes asking for page 2^63 - 1 in letters: a label of 354,745,078,340,568,301
+    /// letters, whose allocation aborted the process (an abort, not a panic `inspect` can catch).
+    const HOSTILE_LABEL: &[u8] = b"%PDF-1.7
+1 0 obj << /Type /Catalog /Pages 2 0 R /PageLabels << /Nums [0 << /S /a /St 9223372036854775807 >>] >> >> endobj
+2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj
+3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >> endobj
+trailer << /Root 1 0 R >>
+%%EOF";
+
+    #[test]
+    fn a_hostile_page_label_number_opens_with_the_physical_page_number() {
+        let info = inspect(Arc::new(HOSTILE_LABEL.to_vec()), None).expect("opens");
+        assert_eq!(labels_of(&info), ["1"]);
+        assert_eq!(info.warnings, ["Page labels: labels from page 1 exceed 1024 UTF-8 bytes; those pages show their physical page numbers."]);
+    }
+
+    #[test]
+    fn hostile_page_label_numbers_and_prefixes_open_with_physical_page_numbers() {
+        // A range per page, each starting at 2^63 - 1: letters and Roman numerals that long
+        // aren't made; decimal digits are.
+        let max = i64::MAX;
+        let nums = format!(
+            "<< /Nums [0 << /S /a /St {max} >> 1 << /S /A /St {max} >> 2 << /S /r /St {max} >> 3 << /S /R /St {max} >> 4 << /S /D /St {max} >>] >>"
+        );
+        let info = inspect(Arc::new(with_labels(5, &nums, &[])), None).expect("opens");
+        assert_eq!(labels_of(&info), ["1", "2", "3", "4", "9223372036854775807"]);
+        assert_eq!(info.warnings.len(), 4, "{:?}", info.warnings);
+        assert!(info.warnings.iter().all(|w| w.contains("physical page numbers")), "{:?}", info.warnings);
+        // A raw prefix over 2,050 bytes, or a decoded one over 1,024: no label is applied.
+        let x = |n: usize| "x".repeat(n);
+        for (prefix, reason) in [(x(3000), "a raw prefix exceeds 2050 bytes"), (x(1500), "a decoded prefix exceeds 1024 UTF-8 bytes")] {
+            let nums = format!("<< /Nums [0 << /S /r >> 1 << /S /D /P ({prefix}) >>] >>");
+            let info = inspect(Arc::new(with_labels(2, &nums, &[])), None).expect("opens");
+            assert_eq!(labels_of(&info), ["1", "2"]);
+            assert_eq!(info.warnings, [format!("Page labels were skipped: {reason}; using physical page numbers.")]);
+        }
+        // A 1,024-byte prefix leaves no room for the number, so its page keeps its physical
+        // number; 1,023 bytes and "1" make a label of exactly 1,024 bytes, which is shown.
+        let nums = format!("<< /Nums [0 << /S /D /P ({}) >> 1 << /S /D /P ({}) >>] >>", x(1024), x(1023));
+        let info = inspect(Arc::new(with_labels(2, &nums, &[])), None).expect("opens");
+        assert_eq!(labels_of(&info), ["1", format!("{}1", x(1023)).as_str()]);
+        assert_eq!(info.warnings.len(), 1, "{:?}", info.warnings);
+        // Labels of about 1,000 bytes on 4,200 pages, or one 1,000-byte prefix shared by 5,000
+        // ranges: over 4 MiB in all, so no label is applied.
+        let (labels, result) = labels_on(&with_labels(1, &format!("<< /Nums [0 << /S /D /P ({}) >>] >>", x(1000)), &[]), 4200);
+        assert_eq!(result, Err("custom labels exceed 4 MiB in total"));
+        assert!(labels.iter().enumerate().all(|(i, l)| *l == (i + 1).to_string()), "physical numbers");
+        let nums: String = (0..5000).map(|i| format!("{i} << /S /D /P 10 0 R >> ")).collect();
+        let (labels, result) = labels_on(&with_labels(1, &format!("<< /Nums [{nums}] >>"), &[&format!("({})", x(1000))]), 5000);
+        assert_eq!(result, Err("custom labels exceed 4 MiB in total"));
+        assert!(labels.iter().enumerate().all(|(i, l)| *l == (i + 1).to_string()), "physical numbers");
+    }
+
+    #[test]
+    fn hostile_page_label_trees_are_refused_in_bounded_work() {
+        let skipped = |reason: &str| [format!("Page labels were skipped: {reason}; using physical page numbers.")];
+        // A node naming itself three times was walked 3^32 times. Each node is read once now: a
+        // repeat is refused, and so is a subtree shared by two parents, so sharing can't multiply
+        // the work either.
+        let repeats: [&[&str]; 2] =
+            [&["<< /Kids [10 0 R 10 0 R 10 0 R] /Nums [0 << /S /r >>] >>"], &["<< /Kids [11 0 R 11 0 R] >>", "<< /Nums [0 << /S /r >>] >>"]];
+        for extra in repeats {
+            let info = inspect(Arc::new(with_labels(3, "10 0 R", extra)), None).expect("opens");
+            assert_eq!(labels_of(&info), ["1", "2", "3"]);
+            assert_eq!(info.warnings, skipped("the number tree repeats a node or contains a cycle"));
+        }
+        // 200,000 kids: past the budget for the whole tree, so no label is applied.
+        let kids = "11 0 R ".repeat(MAX_LABEL_TREE_WORK);
+        let pdf = with_labels(2, "10 0 R", &[&format!("<< /Kids [{kids}] >>"), "<< /Nums [0 << /S /r >>] >>"]);
+        let info = inspect(Arc::new(pdf), None).expect("opens");
+        assert_eq!(labels_of(&info), ["1", "2"]);
+        assert_eq!(info.warnings, skipped("the number tree has too many entries"));
+    }
+
     const ATTACHMENTS: &[u8] = b"%PDF-1.7
 1 0 obj << /Type /Catalog /Pages 2 0 R /Names << /EmbeddedFiles << /Names [(notes.txt) 6 0 R] >> >> >> endobj
 2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj

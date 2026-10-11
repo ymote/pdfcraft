@@ -1442,6 +1442,62 @@ fn number_pages_past_four_mib_in_total_is_accepted() {
     assert_eq!(crate::page_labels(&d).unwrap()[4_999], format!("{}5000", "x".repeat(1000)));
 }
 
+/// A `pages`-page document whose catalog's `/PageLabels` is `labels`; `extra` objects are
+/// numbered from 3, after the catalog and the page tree.
+fn labelled(pages: usize, labels: &str, extra: &[String]) -> Document {
+    let first_page = 3 + extra.len();
+    let kids: Vec<String> = (0..pages).map(|i| format!("{} 0 R", first_page + i)).collect();
+    let mut objs = vec![
+        format!("<< /Type /Catalog /Pages 2 0 R /PageLabels {labels} >>"),
+        format!("<< /Type /Pages /Kids [{}] /Count {pages} /MediaBox [0 0 300 400] >>", kids.join(" ")),
+    ];
+    objs.extend(extra.iter().cloned());
+    objs.extend((0..pages).map(|_| "<< /Type /Page /Parent 2 0 R >>".to_string()));
+    let mut out = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::new();
+    for (i, o) in objs.iter().enumerate() {
+        offsets.push(out.len());
+        out.extend_from_slice(format!("{} 0 obj\n{o}\nendobj\n", i + 1).as_bytes());
+    }
+    let xref = out.len();
+    out.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", objs.len() + 1).as_bytes());
+    for o in offsets {
+        out.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", objs.len() + 1).as_bytes());
+    open(out)
+}
+
+/// The hostile label trees from ymote/pdfcraft's 221ffad0, kept as regressions on #480's bounds:
+/// reading takes bounded work, a tree past the bounds is refused rather than read in part, and a
+/// refused relabelling changes nothing.
+#[test]
+fn hostile_page_label_trees_are_refused_without_rewriting() {
+    use crate::LabelStyle::*;
+    let refused = |d: &Document| crate::PageLabels::new(d).unwrap_err().to_string();
+    // A node naming itself twice is a repeat, refused rather than read again.
+    let d = labelled(3, "3 0 R", &["<< /Kids [3 0 R 3 0 R] /Nums [0 << /S /r >>] >>".into()]);
+    assert!(refused(&d).contains("the number tree repeats a node or contains a cycle"), "{}", refused(&d));
+    // One range dictionary shared by 1,000 entries, with a 3,000-byte prefix: refused before the
+    // prefix is decoded, and so is relabelling, which changes nothing.
+    let nums: String = (0..1000).map(|i| format!("{i} 3 0 R ")).collect();
+    let mut d = labelled(3, &format!("<< /Nums [{nums}] >>"), &[format!("<< /S /D /P ({}) >>", "x".repeat(3000))]);
+    assert!(refused(&d).contains("a raw prefix exceeds 2050 bytes"), "{}", refused(&d));
+    assert!(crate::page_labels(&d).is_err());
+    assert!(crate::number_pages(&mut d, 0, 1, LowerRoman, "", 1).is_err());
+    assert!(d.modified_objects().is_empty(), "a refused relabelling changes nothing");
+    // A 2,000-byte prefix shared by 3,000 ranges: each decoded prefix is over 1,024 bytes.
+    let nums: String = (0..3000).map(|i| format!("{i} << /S /D /P 3 0 R >> ")).collect();
+    let d = labelled(1, &format!("<< /Nums [{nums}] >>"), &[format!("({})", "x".repeat(2000))]);
+    assert!(refused(&d).contains("a decoded prefix exceeds 1024 UTF-8 bytes"), "{}", refused(&d));
+    // 200,000 kids: past the budget for the whole tree.
+    let d = labelled(1, "3 0 R", &[format!("<< /Kids [{}] >>", "4 0 R ".repeat(200_000)), "<< /Nums [0 << /S /r >>] >>".into()]);
+    assert!(refused(&d).contains("the number tree has too many entries"), "{}", refused(&d));
+    // Labels of about 2 KB on 2,200 pages: each one is over 1,024 bytes.
+    let d = labelled(2200, &format!("<< /Nums [0 << /S /D /P ({}) >>] >>", "x".repeat(2000)), &[]);
+    assert!(refused(&d).contains("a decoded prefix exceeds 1024 UTF-8 bytes"), "{}", refused(&d));
+}
+
 #[test]
 fn page_boxes_default_inherit_and_set() {
     let mut doc = open(fixture());
